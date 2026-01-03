@@ -24,6 +24,13 @@ APP_TITLE = "ディズニー混雑点数ナビ"
 # 例: PASSWORD_SHA256="(sha256の16進文字列)"  または APP_PASSPHRASE_HASH="(sha256の16進文字列)"
 SECRET_KEY_NAME = "APP_PASSPHRASE_HASH"
 
+# 選択肢（表示文字を一元管理）
+CHOICES = {
+    'none': '採用しない',
+    'wait': '並ぶ',
+    'dpa': 'DPA',
+}
+
 
 def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
