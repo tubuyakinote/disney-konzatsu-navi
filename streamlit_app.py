@@ -92,6 +92,14 @@ def load_default_attractions() -> pd.DataFrame:
         for c in ["wait", "dpa"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# 文字の揺れを吸収して重複排除（同一パーク×同一名称）
+if "park" in df.columns:
+    df["park"] = df["park"].astype(str).str.strip()
+if "attraction" in df.columns:
+    df["attraction"] = df["attraction"].astype(str).str.strip()
+if "park" in df.columns and "attraction" in df.columns:
+    df = df.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
         return df
 
     # フォールバック（万一ファイルが無いとき）
@@ -287,6 +295,19 @@ def main():
                 "選択": st.column_config.SelectboxColumn("選択", options=["採用しない", "並ぶ", "DPA"], width="small"),
             },
         )
+
+# --- ここが重要：data_editor の編集結果を session_state に保存して次回以降も保持する ---
+edited = edited.copy()
+# 数値列を確実に数値化（None/空欄は NaN になる）
+if "wait" in edited.columns:
+    edited["wait"] = pd.to_numeric(edited["wait"], errors="coerce")
+if "dpa" in edited.columns:
+    edited["dpa"] = pd.to_numeric(edited["dpa"], errors="coerce")
+# 念のため選択列の欠損を埋める
+if "choice" in edited.columns:
+    edited["choice"] = edited["choice"].fillna(CHOICES["none"])
+st.session_state["df_points"] = edited
+df_points = edited
 
         # 編集結果を内部形式に戻す
         df_back = edited.rename(
