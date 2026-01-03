@@ -296,18 +296,18 @@ def main():
             },
         )
 
-# --- ここが重要：data_editor の編集結果を session_state に保存して次回以降も保持する ---
-edited = edited.copy()
-# 数値列を確実に数値化（None/空欄は NaN になる）
-if "wait" in edited.columns:
-    edited["wait"] = pd.to_numeric(edited["wait"], errors="coerce")
-if "dpa" in edited.columns:
-    edited["dpa"] = pd.to_numeric(edited["dpa"], errors="coerce")
-# 念のため選択列の欠損を埋める
-if "choice" in edited.columns:
-    edited["choice"] = edited["choice"].fillna(CHOICES["none"])
-st.session_state["df_points"] = edited
-df_points = edited
+        # --- ここが重要：data_editor の編集結果を session_state に保存して次回以降も保持する ---
+        edited = edited.copy()
+        # 数値列を確実に数値化（None/空欄は NaN になる）
+        if "wait" in edited.columns:
+            edited["wait"] = pd.to_numeric(edited["wait"], errors="coerce")
+        if "dpa" in edited.columns:
+            edited["dpa"] = pd.to_numeric(edited["dpa"], errors="coerce")
+        # 念のため選択列の欠損を埋める
+        if "choice" in edited.columns:
+            edited["choice"] = edited["choice"].fillna(CHOICES["none"])
+        st.session_state["df_points"] = edited
+        df_points = edited
 
         # 編集結果を内部形式に戻す
         df_back = edited.rename(
