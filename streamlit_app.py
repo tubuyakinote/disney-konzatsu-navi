@@ -93,13 +93,13 @@ def load_default_attractions() -> pd.DataFrame:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# 文字の揺れを吸収して重複排除（同一パーク×同一名称）
-if "park" in df.columns:
-    df["park"] = df["park"].astype(str).str.strip()
-if "attraction" in df.columns:
-    df["attraction"] = df["attraction"].astype(str).str.strip()
-if "park" in df.columns and "attraction" in df.columns:
-    df = df.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
+        # 文字の揺れを吸収して重複排除（同一パーク×同一名称）
+        if "park" in df.columns:
+            df["park"] = df["park"].astype(str).str.strip()
+        if "attraction" in df.columns:
+            df["attraction"] = df["attraction"].astype(str).str.strip()
+        if "park" in df.columns and "attraction" in df.columns:
+            df = df.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
         return df
 
     # フォールバック（万一ファイルが無いとき）
