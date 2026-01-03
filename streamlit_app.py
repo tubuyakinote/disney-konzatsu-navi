@@ -7,13 +7,21 @@ from typing import Dict, Any, Optional
 import pandas as pd
 import streamlit as st
 
+def _rerun():
+    # Streamlitのバージョン差分吸収（st.experimental_rerun は新しめで削除されています）
+    if hasattr(st, 'rerun'):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+
 APP_TITLE = "ディズニー混雑点数ナビ"
 
 # =========================
 # Secrets / Login
 # =========================
 # Streamlit Cloud: App settings → Secrets に TOML形式で貼り付け
-# 例: APP_PASSPHRASE_HASH="(sha256の16進文字列)"
+# 例: PASSWORD_SHA256="(sha256の16進文字列)"  または APP_PASSPHRASE_HASH="(sha256の16進文字列)"
 SECRET_KEY_NAME = "APP_PASSPHRASE_HASH"
 
 
@@ -24,17 +32,25 @@ def sha256_hex(text: str) -> str:
 def verify_passphrase(passphrase: str) -> bool:
     """
     passphrase を sha256 して、Secrets のハッシュと一致するか。
+    Secrets は以下どちらのキーでもOK（互換運用）:
+      - PASSWORD_SHA256
+      - APP_PASSPHRASE_HASH（旧キー）
     """
+    expected = ""
     try:
+        # まず新キーを優先
         expected = st.secrets.get("PASSWORD_SHA256", "")
+        if not expected:
+            expected = st.secrets.get(SECRET_KEY_NAME, "")
     except Exception:
         expected = ""  # local で secrets が無い場合など
 
     if not expected:
-        # 秘密鍵が未設定なら「ログインできない」のではなく、セットアップ案内を出す
         st.error(
             "ログイン用の設定（Secrets）が見つかりません。\n\n"
             "ローカルで動かす場合は、このプロジェクト直下に `.streamlit/secrets.toml` を作成し、\n"
+            'PASSWORD_SHA256="(sha256)"\n'
+            "または\n"
             f'{SECRET_KEY_NAME}="(sha256)"\n'
             "の形式で保存してください。"
         )
@@ -134,51 +150,44 @@ def crowd_limit_30min(crowd: str) -> float:
     }[crowd]
 
 
-def evaluate(score: float, crowd: str, wait_tolerance: str) -> Dict[str, Any]:
+def evaluate(total_points: float, limit: float) -> Dict[str, Any]:
     """
-    score: 補正後の「合計点（正規化）」。
-    crowd/待ち許容 に対して、どれくらい厳しいかを返す。
+    total_points: 合計点（選択した点の単純合計）
+    limit: この条件で「待ち許容内」を狙う目安上限（条件補正は limit 側に反映）
     """
-    limit = crowd_limit_30min(crowd) * wait_tolerance_factor(wait_tolerance)
-
-    # 余裕度（<=1 が目標内）
-    ratio = score / limit if limit > 0 else 999
+    ratio = total_points / limit if limit > 0 else 999
 
     if ratio <= 0.75:
         label = "かなりラク（余白あり）"
-        msg = "待ち30分（または選択した許容）に収めやすい構成です。ショー/休憩/偶然の寄り道も入れやすい。"
+        msg = "待ち許容内に収めやすい構成です。ショー/休憩/偶然の寄り道も入れやすい。"
     elif ratio <= 1.00:
         label = "だいたいOK（計画通りなら成立）"
-        msg = "目標ライン上です。開園待ち・移動・食事の段取り次第で体感が変わります。"
+        msg = "目安上限付近です。開園待ち・移動・食事の段取り次第で体感が変わります。"
     elif ratio <= 1.25:
         label = "けっこう大変（待ち・妥協が出やすい）"
         msg = "どこかで待ち時間超過 or 予定変更が起きやすいです。『捨てる候補』を先に決めるのが安全。"
     else:
         label = "無理寄り（超・計画職人向け）"
-        msg = "この条件だと、待ち30分（または許容）を維持するのはかなり厳しめ。DPA/入園アドバンテージ前提に。"
+        msg = "この条件だと、待ち許容内を維持するのはかなり厳しめ。DPA/入園アドバンテージ前提に。"
 
-    return {"limit": limit, "ratio": ratio, "label": label, "message": msg}
+    return {"limit": float(limit), "ratio": ratio, "label": label, "message": msg}
 
 
 def normalize_raw_total(raw_total: float) -> float:
     """
-    アトラクションの点数（例: 10点満点系）が積み上がると大きくなるので、
-    Excelの目安（5〜12点くらい）に合わせてスケールを落とす。
-    今回は「/5」を採用。（例：60点→12点）
+    互換のため残しているが、v2以降は「合計点は補正しない」方針。
+    そのため raw_total をそのまま返す。
     """
-    return raw_total / 5.0
+    return float(raw_total)
 
 
-# =========================
-# UI
-# =========================
 def render_about():
     with st.expander("✍️ 仕様・使い方・注意書き", expanded=True):
         st.markdown(
             """
 ### 点数の考え方（ざっくり）
 - **並ぶ（待ち耐性）**：待ち時間が長いほど、体力・時間・判断が削られやすい → 高得点  
-- **DPA（課金/確保難易度）**：DPAなど「お金で時間を買う」手段が**必要になる度合い**が高いほど高得点。  
+- **DPA（課金/確保難易度）**：DPAなど「お金で時間を買う」手段が**必要になる度合い**が高いほど高得点。さらに、DPAは先着枠のため**確保に労力（開園待ち・取得争奪）**が必要になりやすい点も加味しています。  
   ※DPAは先着で、**取得のための労力（開園待ち/朝イチの動き）**も発生しうるため、難易度として加点します。
 
 ### このアプリは誰向け？
@@ -189,7 +198,7 @@ def render_about():
 ### 使い方
 1. 右の条件（混雑・同伴者・待ち許容など）を設定
 2. 下の点数表で、各アトラクションを **「並ぶ」or「DPA」** で選択
-3. 右側に **合計点（補正後）** と評価が出ます
+3. 右側に **合計点** と評価が出ます（評価文は「決定」で表示）
 
 ### 注意（大事）
 - これは「現地の回り方を縛る」ツールではなく、**余白を確保するため**の道具です。
@@ -226,6 +235,7 @@ def main():
     df_default = load_default_attractions()
 
     # ユーザー編集用に session_state に保持
+    st.session_state.setdefault("confirmed", False)
     if "df_points" not in st.session_state:
         st.session_state["df_points"] = df_default.copy()
 
@@ -263,20 +273,17 @@ def main():
         )
 
         # DPAが無いものは「—」表示に寄せる（編集は数値/空でOK）
-        def dpa_display(v):
-            return "—" if pd.isna(v) else v
-
-        df_show["DPA（点）"] = df_show["DPA（点）"].apply(dpa_display)
-
         edited = st.data_editor(
             df_show,
+            key="points_editor",
+            use_container_width=True,
             height=520,
             hide_index=True,
             column_config={
                 "パーク": st.column_config.SelectboxColumn("パーク", options=["TDL", "TDS"], width="small"),
                 "アトラクション": st.column_config.TextColumn("アトラクション", width="large"),
                 "並ぶ（点）": st.column_config.NumberColumn("並ぶ（点）", min_value=0.0, step=1.0, width="small"),
-                "DPA（点）": st.column_config.TextColumn("DPA（点）", width="small"),
+                "DPA（点）": st.column_config.NumberColumn("DPA（点）", width="small"),
                 "選択": st.column_config.SelectboxColumn("選択", options=["採用しない", "並ぶ", "DPA"], width="small"),
             },
         )
@@ -286,7 +293,7 @@ def main():
             columns={"パーク": "park", "アトラクション": "attraction", "並ぶ（点）": "wait", "DPA（点）": "dpa", "選択": "choice"}
         )
         # dpa を数値に戻す（— は NaN）
-        df_back["dpa"] = df_back["dpa"].replace("—", pd.NA)
+        # dpa は数値のまま（空欄は NaN）
         df_back["dpa"] = pd.to_numeric(df_back["dpa"], errors="coerce")
         df_back["wait"] = pd.to_numeric(df_back["wait"], errors="coerce").fillna(0.0)
 
@@ -313,19 +320,30 @@ def main():
             }
         )
 
-    score = normalize_raw_total(raw_total)
-    score_adj = score * child_modifier(group) * perk_modifier(happy, vacap)
-    ev = evaluate(score_adj, crowd=crowd, wait_tolerance=wait_tol)
+    total_points = normalize_raw_total(raw_total)  # 合計点は補正しない（raw_totalをそのまま返す）
+    limit = crowd_limit_30min(crowd) * wait_tolerance_factor(wait_tol) * child_modifier(group) * perk_modifier(happy, vacap)
+    ev = evaluate(total_points, limit)
 
     with col_right:
-        st.metric("合計点（補正後）", f"{score_adj:.1f} 点")
+        st.metric("合計点", f"{total_points:.1f} 点")
         st.caption(f"目安上限（この条件で“待ち許容内”を狙うライン）: **{ev['limit']:.1f} 点**")
-        st.markdown(f"### 評価：{ev['label']}")
-        st.write(ev["message"])
 
-        if st.button("選択全解除"):
-            st.session_state["df_points"]["choice"] = "採用しない"
-            st.experimental_rerun()
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            if st.button("決定（評価文を表示）"):
+                st.session_state["confirmed"] = True
+                _rerun()
+        with btn_col2:
+            if st.button("選択全解除"):
+                st.session_state["df_points"]["choice"] = "採用しない"
+                st.session_state["confirmed"] = False
+                _rerun()
+
+        if st.session_state.get("confirmed", False):
+            st.markdown(f"### 評価：{ev['label']}")
+            st.write(ev["message"])
+        else:
+            st.info("「決定」を押すと、評価とコピペ用文章が表示されます。")
 
         st.divider()
         st.markdown("### 選択内容")
@@ -342,7 +360,7 @@ def main():
                 f"条件：{crowd} / {group} / 待ち許容={wait_tol}"
                 + (" / ハッピーエントリーあり" if happy else "")
                 + (" / バケパあり" if vacap else "")
-                + f"\n合計点（補正後）：{score_adj:.1f}点（目安上限 {ev['limit']:.1f}点）"
+                + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
                 + f"\n評価：{ev['label']}\n{ev['message']}"
             ),
             height=140,
