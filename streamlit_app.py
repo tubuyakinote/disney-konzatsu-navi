@@ -26,7 +26,7 @@ def verify_passphrase(passphrase: str) -> bool:
     passphrase を sha256 して、Secrets のハッシュと一致するか。
     """
     try:
-        expected = st.secrets.get(SECRET_KEY_NAME, "")
+        expected = st.secrets.get("PASSWORD_SHA256", "")
     except Exception:
         expected = ""  # local で secrets が無い場合など
 
