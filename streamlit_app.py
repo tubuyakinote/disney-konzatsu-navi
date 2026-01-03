@@ -123,23 +123,23 @@ def load_default_attractions() -> pd.DataFrame:
 
 
 def child_modifier(group: str) -> float:
-    # 年齢別補正（体力/待機耐性の違い）
+    # 子連れほど難しい＝目安上限は下がる
     return {
         "大人のみ": 1.00,
-        "子連れ（未就学）": 1.18,
-        "子連れ（小学校低学年）": 1.12,
-        "子連れ（小学校高学年）": 1.06,
+        "子連れ（未就学）": 0.85,
+        "子連れ（小学校低学年）": 0.90,
+        "子連れ（小学校高学年）": 0.95,
     }.get(group, 1.00)
 
 
 def perk_modifier(happy_entry: bool, vacap: bool) -> float:
-    # ハッピーエントリー/バケパは “難易度を下げる” 方向
-    mod = 1.00
+    # ハッピーエントリー／バケパは段取り・時間確保に効く＝目安上限は上がる
+    factor = 1.00
     if happy_entry:
-        mod *= 0.90
+        factor *= 1.15
     if vacap:
-        mod *= 0.85
-    return mod
+        factor *= 1.25
+    return factor
 
 
 def wait_tolerance_factor(wait_tolerance: str) -> float:
@@ -152,17 +152,15 @@ def wait_tolerance_factor(wait_tolerance: str) -> float:
 
 
 def crowd_limit_30min(crowd: str) -> float:
-    """
-    添付の「点数条件表.xlsx / Sheet1」(待ち30分目標) の目安を採用。
-    「閑散=12, やや混雑=10, 混雑=8, 大混雑=6, 超混雑=5」
-    """
-    return {
-        "閑散": 12.0,
+    """混雑度から「目安上限（30分待ち基準）」のベース点を返す。"""
+    base = {
+        "空き": 5.0,
+        "やや空き": 6.0,
+        "普通": 8.0,
         "やや混雑": 10.0,
-        "混雑": 8.0,
-        "大混雑": 6.0,
-        "超混雑（完売級）": 5.0,
-    }[crowd]
+        "混雑": 12.0,
+    }
+    return base.get(crowd, 10.0)
 
 
 def evaluate(total_points: float, limit: float) -> Dict[str, Any]:
@@ -238,7 +236,7 @@ def main():
 
     with col_right:
         st.markdown("## 条件（補正）")
-        crowd = st.selectbox("混雑", ["閑散", "やや混雑", "混雑", "大混雑", "超混雑（完売級）"], index=2)
+        crowd = st.selectbox("混雑", ["空き", "やや空き", "普通", "やや混雑", "混雑"], index=4)
         group = st.selectbox("同伴者", ["大人のみ", "子連れ（未就学）", "子連れ（小学校低学年）", "子連れ（小学校高学年）"], index=0)
         wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"], index=1)
         happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
@@ -317,9 +315,7 @@ def main():
         # 念のため選択列の欠損を埋める
         if "choice" in edited.columns:
             edited["choice"] = edited["choice"].fillna(CHOICES["none"])
-        st.session_state["df_points"] = edited
-        df_points = edited
-
+        # NOTE: session_state は表示用DFに差し替えない（内部計算が崩れる）
         # 編集結果を内部形式に戻す
         df_back = edited.rename(
             columns={"パーク": "park", "アトラクション": "attraction", "並ぶ（点）": "wait", "DPA（点）": "dpa", "選択": "choice"}
