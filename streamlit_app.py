@@ -281,20 +281,24 @@ def main():
         )
 
         # DPAが無いものは「—」表示に寄せる（編集は数値/空でOK）
-        edited = st.data_editor(
-            df_show,
-            key="points_editor",
-            use_container_width=True,
-            height=520,
-            hide_index=True,
-            column_config={
-                "パーク": st.column_config.SelectboxColumn("パーク", options=["TDL", "TDS"], width="small"),
-                "アトラクション": st.column_config.TextColumn("アトラクション", width="large"),
-                "並ぶ（点）": st.column_config.NumberColumn("並ぶ（点）", min_value=0.0, step=1.0, width="small"),
-                "DPA（点）": st.column_config.NumberColumn("DPA（点）", width="small"),
-                "選択": st.column_config.SelectboxColumn("選択", options=["採用しない", "並ぶ", "DPA"], width="small"),
-            },
-        )
+        edited = df_show.copy()
+        try:
+            edited = st.data_editor(
+                df_show,
+                key="points_editor",
+                use_container_width=True,
+                height=520,
+                hide_index=True,
+                column_config={
+                    "パーク": st.column_config.SelectboxColumn("パーク", options=["TDL", "TDS"], width="small"),
+                    "アトラクション": st.column_config.TextColumn("アトラクション", width="large"),
+                    "並ぶ（点）": st.column_config.NumberColumn("並ぶ（点）", min_value=0.0, step=1.0, width="small"),
+                    "DPA（点）": st.column_config.NumberColumn("DPA（点）", width="small"),
+                    "選択": st.column_config.SelectboxColumn("選択", options=["採用しない", "並ぶ", "DPA"], width="small"),
+                },
+            )
+        except Exception:
+            edited = df_show.copy()
 
         # --- ここが重要：data_editor の編集結果を session_state に保存して次回以降も保持する ---
         edited = edited.copy()
@@ -306,26 +310,28 @@ def main():
         # 念のため選択列の欠損を埋める
         if "choice" in edited.columns:
             edited["choice"] = edited["choice"].fillna(CHOICES["none"])
+        st.session_state["df_points"] = edited
+        df_points = edited
+
         # 編集結果を内部形式に戻す
-df_back = edited.rename(
-    columns={
-        "パーク": "park",
-        "アトラクション": "attraction",
-        "並ぶ（点）": "wait",
-        "DPA（点）": "dpa",
-        "選択": "choice",
-    }
-)
+        df_back = edited.rename(
+            columns={"パーク": "park", "アトラクション": "attraction", "並ぶ（点）": "wait", "DPA（点）": "dpa", "選択": "choice"}
+        )
+        # 数値へ（DPAが空欄/Noneでも安全に扱う）
+        df_back["wait"] = pd.to_numeric(df_back["wait"], errors="coerce").fillna(0.0)
+        df_back["dpa"] = pd.to_numeric(df_back["dpa"], errors="coerce")
+        df_back["choice"] = df_back["choice"].fillna(CHOICES["none"])
 
-df_back["wait"] = pd.to_numeric(df_back["wait"], errors="coerce").fillna(0.0)
-df_back["dpa"] = pd.to_numeric(df_back["dpa"], errors="coerce")
-df_back["choice"] = df_back["choice"].fillna("採用しない")
+        # DPA点が無い行で「DPA」を選ばれたら、点がNaNになって合計が壊れるので自動で戻す
+        invalid_dpa = (df_back["choice"] == CHOICES["dpa"]) & (df_back["dpa"].isna())
+        if invalid_dpa.any():
+            df_back.loc[invalid_dpa, "choice"] = CHOICES["none"]
+            st.warning("DPA点が登録されていないアトラクションはDPAを選べないため、自動で「採用しない」に戻しました。")
 
-# 🔥 session_state には「英語列」だけ保存
-if not df_back.equals(st.session_state["df_points"]):
-    st.session_state["df_points"] = df_back
-    _rerun()
-
+        # 変更があった場合だけ保存し、即時反映のために再実行（2回操作が必要になる現象を抑止）
+        if ("df_points" not in st.session_state) or (not df_back.equals(st.session_state["df_points"])):
+            st.session_state["df_points"] = df_back
+            _rerun()
     # ----- Compute -----
     df_points = st.session_state["df_points"].copy()
     chosen = df_points[df_points["choice"].isin(["並ぶ", "DPA"])].copy()
