@@ -313,13 +313,21 @@ def main():
         df_back = edited.rename(
             columns={"パーク": "park", "アトラクション": "attraction", "並ぶ（点）": "wait", "DPA（点）": "dpa", "選択": "choice"}
         )
-        # dpa を数値に戻す（— は NaN）
-        # dpa は数値のまま（空欄は NaN）
-        df_back["dpa"] = pd.to_numeric(df_back["dpa"], errors="coerce")
+        # 数値へ（DPAが空欄/Noneでも安全に扱う）
         df_back["wait"] = pd.to_numeric(df_back["wait"], errors="coerce").fillna(0.0)
+        df_back["dpa"] = pd.to_numeric(df_back["dpa"], errors="coerce")
+        df_back["choice"] = df_back["choice"].fillna(CHOICES["none"])
 
-        st.session_state["df_points"] = df_back
+        # DPA点が無い行で「DPA」を選ばれたら、点がNaNになって合計が壊れるので自動で戻す
+        invalid_dpa = (df_back["choice"] == CHOICES["dpa"]) & (df_back["dpa"].isna())
+        if invalid_dpa.any():
+            df_back.loc[invalid_dpa, "choice"] = CHOICES["none"]
+            st.warning("DPA点が登録されていないアトラクションはDPAを選べないため、自動で「採用しない」に戻しました。")
 
+        # 変更があった場合だけ保存し、即時反映のために再実行（2回操作が必要になる現象を抑止）
+        if ("df_points" not in st.session_state) or (not df_back.equals(st.session_state["df_points"])):
+            st.session_state["df_points"] = df_back
+            _rerun()
     # ----- Compute -----
     df_points = st.session_state["df_points"].copy()
     chosen = df_points[df_points["choice"].isin(["並ぶ", "DPA"])].copy()
@@ -327,10 +335,12 @@ def main():
     raw_total = 0.0
     chosen_rows = []
     for _, r in chosen.iterrows():
-        if r["choice"] == "並ぶ":
-            p = float(r["wait"] or 0.0)
+        if r["choice"] == CHOICES["wait"]:
+            p = float(r["wait"]) if pd.notna(r["wait"]) else 0.0
+        elif r["choice"] == CHOICES["dpa"]:
+            p = float(r["dpa"]) if pd.notna(r["dpa"]) else 0.0
         else:
-            p = float(r["dpa"] or 0.0)
+            p = 0.0
         raw_total += p
         chosen_rows.append(
             {
