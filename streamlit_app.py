@@ -151,6 +151,46 @@ def wait_tolerance_factor(wait_tolerance: str) -> float:
     }[wait_tolerance]
 
 
+# =========================
+# Crowd (3-level, by season)  ★:empty  ★★:normal  ★★★:busy
+# =========================
+CROWD_PERIOD_OPTIONS = [
+    "1月（★）",
+    "2月（★）",
+    "3月上旬（★★）",
+    "3月中旬〜下旬（★★★）",
+    "4月上旬（★★★）",
+    "4月中旬〜下旬（★）",
+    "5月上旬（★★★）",
+    "5月中旬〜下旬（★）",
+    "6月（★）",
+    "7月上旬〜中旬（★）",
+    "7月下旬（★★）",
+    "8月上旬（★★）",
+    "8月中旬〜下旬（★★★）",
+    "9月初旬〜中旬（★）",
+    "9月中旬〜10月下旬（★★★）",
+    "11月上旬（★★）",
+    "11月中旬〜12月上旬（★★）",
+    "12月中旬〜下旬（★★★）",
+]
+
+# 「時期」文字列 → ★の個数
+CROWD_STARS_BY_PERIOD = {label: label.count("★") for label in CROWD_PERIOD_OPTIONS}
+
+def crowd_limit_30min_from_stars(stars: int) -> float:
+    """
+    ★が少ないほど空いている＝許容点（目安上限）は高い
+    30分基準のベース点を返す。
+    """
+    base = {
+        1: 12.0,  # 空き（★）
+        2: 9.0,   # 普通（★★）
+        3: 6.0,   # 混雑（★★★）
+    }
+    return base.get(stars, 9.0)
+
+
 def crowd_limit_30min(crowd: str) -> float:
     """混雑度から「目安上限（30分待ち基準）」のベース点を返す。"""
     base = {
@@ -236,7 +276,8 @@ def main():
 
     with col_right:
         st.markdown("## 条件（補正）")
-        crowd = st.selectbox("混雑", ["空き", "やや空き", "普通", "やや混雑", "混雑"], index=4)
+        crowd_period = st.selectbox("混雑（時期の目安）", CROWD_PERIOD_OPTIONS, index=0)
+        crowd_stars = CROWD_STARS_BY_PERIOD.get(crowd_period, 2)
         group = st.selectbox("同伴者", ["大人のみ", "子連れ（未就学）", "子連れ（小学校低学年）", "子連れ（小学校高学年）"], index=0)
         wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"], index=1)
         happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
@@ -359,7 +400,7 @@ def main():
         )
 
     total_points = normalize_raw_total(raw_total)  # 合計点は補正しない（raw_totalをそのまま返す）
-    limit = crowd_limit_30min(crowd) * wait_tolerance_factor(wait_tol) * child_modifier(group) * perk_modifier(happy, vacap)
+    limit = crowd_limit_30min_from_stars(crowd_stars) * wait_tolerance_factor(wait_tol) * child_modifier(group) * perk_modifier(happy, vacap)
     ev = evaluate(total_points, limit)
 
     with col_right:
@@ -395,7 +436,7 @@ def main():
         st.text_area(
             " ",
             value=(
-                f"条件：{crowd} / {group} / 待ち許容={wait_tol}"
+                f"条件：{crowd_period} / {group} / 待ち許容={wait_tol}"
                 + (" / ハッピーエントリーあり" if happy else "")
                 + (" / バケパあり" if vacap else "")
                 + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
