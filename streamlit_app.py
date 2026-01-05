@@ -207,20 +207,20 @@ def normalize_raw_total(raw_total: float) -> float:
 # =========================
 # About (keep layout, replace title/content)
 # =========================
+from pathlib import Path
+
 def render_about():
-    # レイアウトは expander のまま維持。表題だけ変更＋本文はテキストファイルに差替え。
-    body = ""
+    # streamlit_app.py と同じ階層の txt を読む（Cloudでも安定）
+    txt_path = Path(__file__).with_name("点数の考え方.txt")
+
     try:
-        # デプロイ時はリポジトリに置く想定。無ければ下のfallback。
-        with open("点数の考え方.txt", "r", encoding="utf-8") as f:
-            body = f.read().strip()
-    except Exception:
-        # 念のためのフォールバック（ローカル/環境差）
-        body = "（説明文ファイル `点数の考え方.txt` が見つかりません）"
+        body = txt_path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        body = f"（説明文ファイルが見つかりません：{txt_path.name}）"
 
     with st.expander("✍️ 趣旨・仕様・使い方", expanded=True):
-        # txtはプレーンテキストなので、そのまま読みやすく表示
-        st.text(body)
+        # st.text だと環境によって空っぽに見えるケースがあるので markdown で表示
+        st.markdown(body.replace("\n", "  \n"))
 
 
 # =========================
@@ -274,35 +274,10 @@ def main():
     render_about()
 
     # ----- Layout (same 2-col base, per your current stable right panel) -----
-    col_left, col_right = st.columns([1.4, 1.0], gap="large")
+    col_left, col_right = st.columns([1.0, 1.4], gap="large")
 
     # ===== Right: conditions / score / buttons / selection summary =====
     with col_right:
-        st.markdown("## 条件（補正）")
-
-        crowd_period = st.selectbox("混雑（時期の目安）", CROWD_PERIOD_OPTIONS, index=0)
-        crowd_stars = CROWD_STARS_BY_PERIOD.get(crowd_period, 2)
-
-        group = st.selectbox(
-            "同伴者",
-            ["大人のみ", "子連れ（未就学）", "子連れ（小学校低学年）", "子連れ（小学校高学年）"],
-            index=0,
-        )
-
-        wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"], index=1)
-
-        happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
-
-        st.divider()
-
-    # ===== Left: points table =====
-    df_default = load_default_attractions()
-
-    # ユーザー編集用に session_state に保持（点数表そのもの）
-    if "df_points" not in st.session_state:
-        st.session_state["df_points"] = df_default.copy()
-
-    with col_left:
         st.markdown("## 点数表（選ぶ）")
         st.caption("一覧はスクロールできます。点数もこの画面上で編集できます（自分用カスタム）。")
 
@@ -326,6 +301,40 @@ def main():
                 mime="text/csv",
             )
 
+    # ===== Left: points table =====
+    df_default = load_default_attractions()
+
+    # ユーザー編集用に session_state に保持（点数表そのもの）
+    if "df_points" not in st.session_state:
+        st.session_state["df_points"] = df_default.copy()
+
+    with col_left:
+        st.markdown("## 条件（補正）")
+
+        crowd_period = st.selectbox("混雑（時期の目安）", CROWD_PERIOD_OPTIONS, index=0)
+        crowd_stars = CROWD_STARS_BY_PERIOD.get(crowd_period, 2)
+
+        group = st.selectbox(
+            "同伴者",
+            ["大人のみ", "子連れ（未就学）", "子連れ（小学校低学年）", "子連れ（小学校高学年）"],
+            index=0,
+        )
+
+        wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"], index=1)
+
+        happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
+
+       st.divider()
+        
+       # ★ここから下は、点数表の選択結果と合算後に表示したいので、プレースホルダにする
+       ph_metric = st.empty()
+       ph_caption = st.empty()
+       ph_buttons = st.empty()
+       ph_eval = st.empty()
+       st.divider()
+       ph_selected = st.empty()
+       ph_copy = st.empty()
+        
         # ★② パーク絞り込み
         fcol1, fcol2 = st.columns([0.45, 0.55])
         with fcol1:
@@ -480,28 +489,32 @@ def main():
     )
     ev = evaluate(total_points, limit)
 
-    # ===== Right panel (unchanged stable block, but vacap removed) =====
-    with col_right:
+    # === 左側に結果を流し込む（v4レイアウト：左に条件＋結果） ===
+    with ph_metric.container():
         st.metric("合計点", f"{total_points:.1f} 点")
+
+    with ph_caption.container():
         st.caption(f"目安上限（この条件で“待ち許容内”を狙うライン）: **{ev['limit']:.1f} 点**")
 
-        btn_col1, btn_col2 = st.columns(2)
-        with btn_col1:
+    with ph_buttons.container():
+        b1, b2 = st.columns(2)
+        with b1:
             if st.button("決定（評価文を表示）"):
                 st.session_state["confirmed"] = True
                 _rerun()
-        with btn_col2:
+        with b2:
             if st.button("選択全解除（点数表）"):
                 clear_all_selections()
                 _rerun()
 
+    with ph_eval.container():
         if st.session_state.get("confirmed", False):
             st.markdown(f"### 評価：{ev['label']}")
             st.write(ev["message"])
         else:
             st.info("「決定」を押すと、評価とコピペ用文章が表示されます。")
 
-        st.divider()
+    with ph_selected.container():
         st.markdown("### 選択内容")
         if chosen_rows:
             df_sel = pd.DataFrame(chosen_rows).sort_values(["パーク", "点"], ascending=[True, False])
@@ -509,6 +522,7 @@ def main():
         else:
             st.caption("まだ何も選択されていません。")
 
+    with ph_copy.container():
         st.markdown("### 評価文（コピペ用）")
         st.text_area(
             " ",
@@ -520,7 +534,6 @@ def main():
             ),
             height=140,
         )
-
 
 if __name__ == "__main__":
     main()
