@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 import hashlib
 import hmac
+from pathlib import Path
 from typing import Dict, Any
 
 import pandas as pd
 import streamlit as st
 
 
+# =========================
+# Utils
+# =========================
 def _rerun():
     if hasattr(st, "rerun"):
         st.rerun()
@@ -22,14 +26,6 @@ APP_TITLE = "ディズニー混雑点数ナビ"
 SECRET_KEY_NAME = "APP_PASSPHRASE_HASH"
 
 
-# 表示文字の一元管理（内部状態にも使う）
-MODE_WAIT = "並ぶ"
-MODE_DPA = "DPA"
-MODE_PP = "PP"  # 今回追加
-
-# =========================
-# Auth
-# =========================
 def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -73,6 +69,14 @@ def login_gate() -> bool:
 
 
 # =========================
+# Constants (selection modes)
+# =========================
+MODE_WAIT = "並ぶ"
+MODE_DPA = "DPA"
+MODE_PP = "PP"  # 追加
+
+
+# =========================
 # Data
 # =========================
 @st.cache_data
@@ -87,6 +91,7 @@ def load_default_attractions() -> pd.DataFrame:
 
     if os.path.exists("attractions_master.csv"):
         df = pd.read_csv("attractions_master.csv")
+
         for c in ["wait", "dpa", "pp"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -95,6 +100,7 @@ def load_default_attractions() -> pd.DataFrame:
             df["park"] = df["park"].astype(str).str.strip()
         if "attraction" in df.columns:
             df["attraction"] = df["attraction"].astype(str).str.strip()
+
         if "park" in df.columns and "attraction" in df.columns:
             df = df.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
 
@@ -104,7 +110,7 @@ def load_default_attractions() -> pd.DataFrame:
 
         return df
 
-    # フォールバック（万一ファイルが無いとき）
+    # フォールバック
     return pd.DataFrame(
         [
             {"park": "TDS", "attraction": "ソアリン：ファンタスティック・フライト", "wait": 5, "dpa": 4, "pp": pd.NA},
@@ -117,6 +123,9 @@ def load_default_attractions() -> pd.DataFrame:
     )
 
 
+# =========================
+# Modifiers / Evaluation
+# =========================
 def child_modifier(group: str) -> float:
     return {
         "大人のみ": 1.00,
@@ -127,7 +136,7 @@ def child_modifier(group: str) -> float:
 
 
 def perk_modifier(happy_entry: bool) -> float:
-    # ★今回：バケパ削除（ハッピーエントリーのみ残す）
+    # バケパ削除（ハッピーエントリーのみ）
     factor = 1.00
     if happy_entry:
         factor *= 1.15
@@ -142,9 +151,6 @@ def wait_tolerance_factor(wait_tolerance: str) -> float:
     }[wait_tolerance]
 
 
-# =========================
-# Crowd (3-level, by season)  ★:empty  ★★:normal  ★★★:busy
-# =========================
 CROWD_PERIOD_OPTIONS = [
     "1月（★）",
     "2月（★）",
@@ -200,50 +206,40 @@ def evaluate(total_points: float, limit: float) -> Dict[str, Any]:
 
 
 def normalize_raw_total(raw_total: float) -> float:
-    # v2以降：合計点は補正しない
+    # 合計点は補正しない
     return float(raw_total)
 
 
 # =========================
-# About (keep layout, replace title/content)
+# About (txt from same folder)
 # =========================
-from pathlib import Path
-
 def render_about():
-    # streamlit_app.py と同じ階層の txt を読む（Cloudでも安定）
     txt_path = Path(__file__).with_name("点数の考え方.txt")
-
     try:
         body = txt_path.read_text(encoding="utf-8").strip()
-    except Exception as e:
-        body = f"（説明文ファイルが見つかりません：{txt_path.name}）"
+        if not body:
+            body = "（説明文ファイルは読み込めましたが、中身が空です）"
+    except Exception:
+        body = f"（説明文ファイルが見つかりません：{txt_path.name}）\n\n※Streamlit Cloud運用では、リポジトリ直下にこのtxtを置いてください。"
 
     with st.expander("✍️ 趣旨・仕様・使い方", expanded=True):
-        # st.text だと環境によって空っぽに見えるケースがあるので markdown で表示
         st.markdown(body.replace("\n", "  \n"))
 
 
 # =========================
-# Selection logic (cell-buttons)
+# Selection state
 # =========================
 def _ensure_state():
     st.session_state.setdefault("confirmed", False)
-    st.session_state.setdefault("selected", {})  # key: row_id(str) -> mode (並ぶ/DPA/PP)
+    st.session_state.setdefault("selected", {})  # row_key -> mode
     st.session_state.setdefault("park_filter", "ALL")
 
 
 def _row_id(park: str, attraction: str) -> str:
-    # 重複排除の前提はあるが、念のためkeyを安定化
     return f"{park}__{attraction}"
 
 
 def toggle_select(row_key: str, mode: str):
-    """
-    同一アトラクションで排他：
-      - 未選択 → mode を選択
-      - 同じmodeを再度押す → 解除
-      - 別modeを押す → 差し替え
-    """
     cur = st.session_state["selected"].get(row_key)
     if cur == mode:
         st.session_state["selected"].pop(row_key, None)
@@ -269,45 +265,21 @@ def main():
 
     _ensure_state()
 
-    st.title(APP_TITLE)
+    # 先に点数表を確実に初期化（右カラムのdownload_buttonで参照するため）
+    if "df_points" not in st.session_state:
+        st.session_state["df_points"] = load_default_attractions().copy()
 
+    st.title(APP_TITLE)
     render_about()
 
-    # ----- Layout (same 2-col base, per your current stable right panel) -----
+    # v4：左右入替
+    #  左：条件/結果
+    #  右：点数表
     col_left, col_right = st.columns([1.0, 1.4], gap="large")
 
-    # ===== Right: conditions / score / buttons / selection summary =====
-    with col_right:
-        st.markdown("## 点数表（選ぶ）")
-        st.caption("一覧はスクロールできます。点数もこの画面上で編集できます（自分用カスタム）。")
-
-        # 任意：CSV入出力は残す（現状のまま）
-        with st.expander("（任意）点数表CSVの読み込み/書き出し", expanded=False):
-            up = st.file_uploader("attractions_master.csv をアップロード（上書き）", type=["csv"])
-            if up is not None:
-                df_up = pd.read_csv(up)
-                for c in ["wait", "dpa", "pp"]:
-                    if c in df_up.columns:
-                        df_up[c] = pd.to_numeric(df_up[c], errors="coerce")
-                if "pp" not in df_up.columns:
-                    df_up["pp"] = pd.NA
-                st.session_state["df_points"] = df_up
-                st.success("点数表を読み込みました。")
-
-            st.download_button(
-                "現在の点数表をCSVでダウンロード",
-                st.session_state["df_points"].to_csv(index=False).encode("utf-8-sig"),
-                file_name="attractions_master.csv",
-                mime="text/csv",
-            )
-
-    # ===== Left: points table =====
-    df_default = load_default_attractions()
-
-    # ユーザー編集用に session_state に保持（点数表そのもの）
-    if "df_points" not in st.session_state:
-        st.session_state["df_points"] = df_default.copy()
-
+    # =========================
+    # LEFT: conditions + results (placeholders)
+    # =========================
     with col_left:
         st.markdown("## 条件（補正）")
 
@@ -321,12 +293,11 @@ def main():
         )
 
         wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"], index=1)
-
         happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
 
         st.divider()
-        
-        # ★ここから下は、点数表の選択結果と合算後に表示したいので、プレースホルダにする
+
+        # 「結果」表示エリア（ここに後で流し込む）
         ph_metric = st.empty()
         ph_caption = st.empty()
         ph_buttons = st.empty()
@@ -334,23 +305,60 @@ def main():
         st.divider()
         ph_selected = st.empty()
         ph_copy = st.empty()
-        
-        # ★② パーク絞り込み
+
+    # =========================
+    # RIGHT: points table + filter + editor + CSV IO
+    # =========================
+    with col_right:
+        st.markdown("## 点数表（選ぶ）")
+        st.caption("一覧はスクロールできます。点数もこの画面上で編集できます（自分用カスタム）。")
+
+        # CSV IO
+        with st.expander("（任意）点数表CSVの読み込み/書き出し", expanded=False):
+            up = st.file_uploader("attractions_master.csv をアップロード（上書き）", type=["csv"])
+            if up is not None:
+                df_up = pd.read_csv(up)
+
+                for c in ["wait", "dpa", "pp"]:
+                    if c in df_up.columns:
+                        df_up[c] = pd.to_numeric(df_up[c], errors="coerce")
+                if "pp" not in df_up.columns:
+                    df_up["pp"] = pd.NA
+
+                if "park" in df_up.columns:
+                    df_up["park"] = df_up["park"].astype(str).str.strip()
+                if "attraction" in df_up.columns:
+                    df_up["attraction"] = df_up["attraction"].astype(str).str.strip()
+                if "park" in df_up.columns and "attraction" in df_up.columns:
+                    df_up = df_up.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
+
+                st.session_state["df_points"] = df_up
+                st.success("点数表を読み込みました。")
+
+            st.download_button(
+                "現在の点数表をCSVでダウンロード",
+                st.session_state["df_points"].to_csv(index=False).encode("utf-8-sig"),
+                file_name="attractions_master.csv",
+                mime="text/csv",
+            )
+
+        # Park filter
         fcol1, fcol2 = st.columns([0.45, 0.55])
         with fcol1:
             park_filter = st.selectbox("パーク絞り込み", ["ALL", "TDLのみ", "TDSのみ"], index=0)
             st.session_state["park_filter"] = park_filter
 
-        # 点数表（内部）
+        # base df
         df_points = st.session_state["df_points"].copy()
         for c in ["wait", "dpa", "pp"]:
             if c not in df_points.columns:
                 df_points[c] = pd.NA
+
         df_points["wait"] = pd.to_numeric(df_points["wait"], errors="coerce").fillna(0.0)
         df_points["dpa"] = pd.to_numeric(df_points["dpa"], errors="coerce")
         df_points["pp"] = pd.to_numeric(df_points["pp"], errors="coerce")
 
-        # 表示対象フィルタ
+        # view filter
         df_view = df_points.copy()
         if park_filter == "TDLのみ":
             df_view = df_view[df_view["park"] == "TDL"]
@@ -358,8 +366,7 @@ def main():
             df_view = df_view[df_view["park"] == "TDS"]
         df_view = df_view.reset_index(drop=True)
 
-        # ★③ セルをボタン化した選択UI（スクロールコンテナ）
-        # ヘッダ行
+        # header
         h1, h2, h3, h4, h5 = st.columns([0.12, 0.55, 0.11, 0.11, 0.11])
         h1.markdown("**パーク**")
         h2.markdown("**アトラクション**")
@@ -369,7 +376,7 @@ def main():
 
         st.caption("点数セルを押して選択（同一アトラクションは排他。もう一度押すと解除）")
 
-        # スクロール枠（高さは現状の表のイメージに合わせて）
+        # scroll container
         with st.container(height=520):
             for _, r in df_view.iterrows():
                 park = str(r.get("park", "")).strip()
@@ -386,7 +393,6 @@ def main():
                 c1.write(park)
                 c2.write(name)
 
-                # 並ぶ（点）は常に押せる（0点でも押せるが意味薄いので 0 は disabled）
                 c3.button(
                     f"{wait_p:.0f}" if wait_p == int(wait_p) else f"{wait_p}",
                     key=f"btn_wait__{row_key}",
@@ -397,7 +403,6 @@ def main():
                     use_container_width=True,
                 )
 
-                # DPA（点）空欄なら押せない
                 c4.button(
                     ("—" if pd.isna(dpa_p) else f"{float(dpa_p):.0f}"),
                     key=f"btn_dpa__{row_key}",
@@ -408,7 +413,6 @@ def main():
                     use_container_width=True,
                 )
 
-                # PP（点）空欄なら押せない
                 c5.button(
                     ("—" if pd.isna(pp_p) else f"{float(pp_p):.0f}"),
                     key=f"btn_pp__{row_key}",
@@ -419,7 +423,7 @@ def main():
                     use_container_width=True,
                 )
 
-        # 点数編集（ここは“編集したい人用”として残す：現状の「編集できる」を守る）
+        # editor
         with st.expander("（任意）点数表を編集する（並ぶ/DPA/PP）", expanded=False):
             df_edit = df_points.rename(
                 columns={"park": "パーク", "attraction": "アトラクション", "wait": "並ぶ（点）", "dpa": "DPA（点）", "pp": "PP（点）"}
@@ -444,19 +448,20 @@ def main():
             back["wait"] = pd.to_numeric(back["wait"], errors="coerce").fillna(0.0)
             back["dpa"] = pd.to_numeric(back["dpa"], errors="coerce")
             back["pp"] = pd.to_numeric(back["pp"], errors="coerce")
+
             if not back.equals(st.session_state["df_points"]):
                 st.session_state["df_points"] = back
                 st.success("点数表を更新しました（選択状態は保持されます）。")
 
-    # ===== Compute (合計点は単純合算 / 目安上限は別ロジック) =====
+    # =========================
+    # Compute + render results on LEFT placeholders
+    # =========================
     df_points = st.session_state["df_points"].copy()
     selected = st.session_state["selected"].copy()
 
     raw_total = 0.0
     chosen_rows = []
 
-    # 選択されたrow_keyから点数を引く
-    # row_key = "park__attraction"
     for row_key, mode in selected.items():
         try:
             park, name = row_key.split("__", 1)
@@ -489,7 +494,7 @@ def main():
     )
     ev = evaluate(total_points, limit)
 
-    # === 左側に結果を流し込む（v4レイアウト：左に条件＋結果） ===
+    # LEFT output
     with ph_metric.container():
         st.metric("合計点", f"{total_points:.1f} 点")
 
@@ -499,11 +504,11 @@ def main():
     with ph_buttons.container():
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("決定（評価文を表示）"):
+            if st.button("決定（評価文を表示）", key="btn_confirm_left"):
                 st.session_state["confirmed"] = True
                 _rerun()
         with b2:
-            if st.button("選択全解除（点数表）"):
+            if st.button("選択全解除（点数表）", key="btn_clear_left"):
                 clear_all_selections()
                 _rerun()
 
@@ -533,8 +538,9 @@ def main():
                 + f"\n評価：{ev['label']}\n{ev['message']}"
             ),
             height=140,
+            key="copy_text_left",
         )
+
 
 if __name__ == "__main__":
     main()
-    
