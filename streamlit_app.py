@@ -324,16 +324,16 @@ def main():
 
         happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
 
-       st.divider()
+        st.divider()
         
-       # ★ここから下は、点数表の選択結果と合算後に表示したいので、プレースホルダにする
-       ph_metric = st.empty()
-       ph_caption = st.empty()
-       ph_buttons = st.empty()
-       ph_eval = st.empty()
-       st.divider()
-       ph_selected = st.empty()
-       ph_copy = st.empty()
+        # ★ここから下は、点数表の選択結果と合算後に表示したいので、プレースホルダにする
+        ph_metric = st.empty()
+        ph_caption = st.empty()
+        ph_buttons = st.empty()
+        ph_eval = st.empty()
+        st.divider()
+        ph_selected = st.empty()
+        ph_copy = st.empty()
         
         # ★② パーク絞り込み
         fcol1, fcol2 = st.columns([0.45, 0.55])
