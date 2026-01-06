@@ -227,6 +227,8 @@ def _ensure_state():
     st.session_state.setdefault("confirmed", False)
     st.session_state.setdefault("selected", {})  # row_key -> mode
     st.session_state.setdefault("park_filter", "ALL")
+    st.session_state.setdefault("copy_text_left", "")
+    st.session_state.setdefault("copy_sig_left", "")  # 表示内容の署名（更新判定用）
 
 
 def _row_id(park: str, attraction: str) -> str:
@@ -244,6 +246,8 @@ def toggle_select(row_key: str, mode: str):
 def clear_all_selections():
     st.session_state["selected"] = {}
     st.session_state["confirmed"] = False
+    st.session_state["copy_text_left"] = ""
+    st.session_state["copy_sig_left"] = ""
 
 
 def compute_total_and_rows(df_points: pd.DataFrame, selected: Dict[str, str]) -> Tuple[float, List[Dict[str, Any]]]:
@@ -275,6 +279,21 @@ def compute_total_and_rows(df_points: pd.DataFrame, selected: Dict[str, str]) ->
     return normalize_raw_total(raw_total), chosen_rows
 
 
+def _make_copy_text(crowd_period: str, wait_tol: str, happy: bool, total_points: float, limit: float, label: str, msg: str) -> str:
+    return (
+        f"条件：{crowd_period} / 待ち許容={wait_tol}"
+        + (" / ハッピーエントリーあり" if happy else "")
+        + f"\n合計点：{total_points:.1f}点（目安上限 {limit:.1f}点）"
+        + f"\n評価：{label}\n{msg}"
+    )
+
+
+def _make_sig(crowd_period: str, wait_tol: str, happy: bool, total_points: float, limit: float, label: str, msg: str) -> str:
+    # 画面が更新されても「同じ内容なら書き換えない」用の署名
+    base = f"{crowd_period}|{wait_tol}|{int(happy)}|{total_points:.3f}|{limit:.3f}|{label}|{msg}"
+    return sha256_hex(base)
+
+
 # =========================
 # Main
 # =========================
@@ -295,11 +314,10 @@ def main():
     st.title(APP_TITLE)
     render_about()
 
-    # v4：左右
     col_left, col_right = st.columns([1.0, 1.4], gap="large")
 
     # =========================
-    # LEFT: conditions + results（先に描画して“瞬断”体感を減らす）
+    # LEFT: conditions + results
     # =========================
     with col_left:
         st.markdown("## 条件（補正）")
@@ -341,11 +359,9 @@ def main():
         with b1:
             if st.button("決定（評価文を表示）", key="btn_confirm_left"):
                 st.session_state["confirmed"] = True
-                # ※明示的 _rerun() は呼ばない（瞬断軽減）
         with b2:
             if st.button("選択全解除（点数表）", key="btn_clear_left"):
                 clear_all_selections()
-                # ※明示的 _rerun() は呼ばない
 
         st.divider()
 
@@ -364,28 +380,40 @@ def main():
         else:
             st.caption("まだ何も選択されていません。")
 
-        # copy用テキストを先に作る（「同伴者」を削除したいなら group は入れない）
-        copy_text = (
-            f"条件：{crowd_period} / 待ち許容={wait_tol}"
-            + (" / ハッピーエントリーあり" if happy else "")
-            + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
-            + f"\n評価：{ev['label']}\n{ev['message']}"
-        )
+        st.divider()
 
-        # text_area の状態初期化（初回だけ）
-        st.session_state.setdefault("copy_text_left", "")
+        # ===== コピー文（決定したら表示、決定後は内容を常に最新化）=====
+        st.markdown("### 評価文（コピペ用）")
 
-        with ph_copy.container():
-            st.markdown("### 評価文（コピペ用）")
+        if st.session_state.get("confirmed", False):
+            copy_text = _make_copy_text(
+                crowd_period=crowd_period,
+                wait_tol=wait_tol,
+                happy=happy,
+                total_points=total_points,
+                limit=ev["limit"],
+                label=ev["label"],
+                msg=ev["message"],
+            )
+            sig = _make_sig(
+                crowd_period=crowd_period,
+                wait_tol=wait_tol,
+                happy=happy,
+                total_points=total_points,
+                limit=ev["limit"],
+                label=ev["label"],
+                msg=ev["message"],
+            )
 
-            if st.session_state.get("confirmed", False):
-                # ★決定後は毎回ここで最新に上書き → これで内容が更新される
+            # 署名が変わったときだけ更新（ユーザーがtext_areaを触った場合の破壊を避けつつ、内容は追従）
+            if st.session_state.get("copy_sig_left", "") != sig:
                 st.session_state["copy_text_left"] = copy_text
+                st.session_state["copy_sig_left"] = sig
 
-                # ★value= は渡さない（key の session_state が優先されるため）
-                st.text_area(" ", key="copy_text_left", height=140)
-            else:
-                st.info("「決定」を押すと、ここに評価文（コピペ用）が表示されます。")
+            # value= は渡さない（keyのsession_stateが優先されるため）
+            st.text_area(" ", key="copy_text_left", height=140)
+        else:
+            st.info("「決定」を押すと、ここに評価文（コピペ用）が表示されます。")
 
     # =========================
     # RIGHT: points table + filter + editor + CSV IO
@@ -415,7 +443,7 @@ def main():
 
                 st.session_state["df_points"] = df_up
                 st.success("点数表を読み込みました。")
-                # ※ここは読み込み直後の反映が重要なので rerun 推奨
+                # 読み込み直後は反映が必要
                 _rerun()
 
             st.download_button(
@@ -535,7 +563,6 @@ def main():
             if not back.equals(st.session_state["df_points"]):
                 st.session_state["df_points"] = back
                 st.success("点数表を更新しました（選択状態は保持されます）。")
-                # 編集結果は即反映したいので rerun
                 _rerun()
 
 
