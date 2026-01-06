@@ -364,18 +364,28 @@ def main():
         else:
             st.caption("まだ何も選択されていません。")
 
-        st.markdown("### 評価文（コピペ用）")
-        st.text_area(
-            " ",
-            value=(
-                f"条件：{crowd_period} / 待ち許容={wait_tol}"
-                + (" / ハッピーエントリーあり" if happy else "")
-                + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
-                + f"\n評価：{ev['label']}\n{ev['message']}"
-            ),
-            height=140,
-            key="copy_text_left",
+        # copy用テキストを先に作る（「同伴者」を削除したいなら group は入れない）
+        copy_text = (
+            f"条件：{crowd_period} / 待ち許容={wait_tol}"
+            + (" / ハッピーエントリーあり" if happy else "")
+            + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
+            + f"\n評価：{ev['label']}\n{ev['message']}"
         )
+
+        # text_area の状態初期化（初回だけ）
+        st.session_state.setdefault("copy_text_left", "")
+
+        with ph_copy.container():
+            st.markdown("### 評価文（コピペ用）")
+
+            if st.session_state.get("confirmed", False):
+                # ★決定後は毎回ここで最新に上書き → これで内容が更新される
+                st.session_state["copy_text_left"] = copy_text
+
+                # ★value= は渡さない（key の session_state が優先されるため）
+                st.text_area(" ", key="copy_text_left", height=140)
+            else:
+                st.info("「決定」を押すと、ここに評価文（コピペ用）が表示されます。")
 
     # =========================
     # RIGHT: points table + filter + editor + CSV IO
