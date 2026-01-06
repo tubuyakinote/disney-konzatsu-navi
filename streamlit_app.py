@@ -8,16 +8,6 @@ import pandas as pd
 import streamlit as st
 
 
-# =========================
-# Utils
-# =========================
-def _rerun():
-    if hasattr(st, "rerun"):
-        st.rerun()
-    else:
-        st.experimental_rerun()
-
-
 APP_TITLE = "ディズニー混雑点数ナビ"
 
 # =========================
@@ -126,15 +116,6 @@ def load_default_attractions() -> pd.DataFrame:
 # =========================
 # Modifiers / Evaluation
 # =========================
-def child_modifier(group: str) -> float:
-    return {
-        "大人のみ": 1.00,
-        "子連れ（未就学）": 0.85,
-        "子連れ（小学校低学年）": 0.90,
-        "子連れ（小学校高学年）": 0.95,
-    }.get(group, 1.00)
-
-
 def perk_modifier(happy_entry: bool) -> float:
     # バケパ削除（ハッピーエントリーのみ）
     factor = 1.00
@@ -151,9 +132,7 @@ def wait_tolerance_factor(wait_tolerance: str) -> float:
     }[wait_tolerance]
 
 
-# =========================
-# Crowd (UPDATED per your list)
-# =========================
+# ★あなた指定の「混雑（時期の目安）」に差し替え
 CROWD_PERIOD_OPTIONS = [
     "1月 上旬（★★★）",
     "1月 中旬（★★）",
@@ -211,14 +190,14 @@ def evaluate(total_points: float, limit: float) -> Dict[str, Any]:
 
 
 def normalize_raw_total(raw_total: float) -> float:
-    # 合計点は補正しない
     return float(raw_total)
 
 
 # =========================
-# About (txt from same folder)
+# About (txt from same folder)  ※チラつき軽減のためキャッシュ
 # =========================
-def render_about():
+@st.cache_data
+def load_about_text() -> str:
     txt_path = Path(__file__).with_name("点数の考え方.txt")
     try:
         body = txt_path.read_text(encoding="utf-8").strip()
@@ -226,7 +205,11 @@ def render_about():
             body = "（説明文ファイルは読み込めましたが、中身が空です）"
     except Exception:
         body = f"（説明文ファイルが見つかりません：{txt_path.name}）\n\n※Streamlit Cloud運用では、リポジトリ直下にこのtxtを置いてください。"
+    return body
 
+
+def render_about():
+    body = load_about_text()
     with st.expander("✍️ 趣旨・仕様・使い方", expanded=True):
         st.markdown(body.replace("\n", "  \n"))
 
@@ -278,8 +261,6 @@ def main():
     render_about()
 
     # v4：左右入替
-    #  左：条件/結果
-    #  右：点数表
     col_left, col_right = st.columns([1.0, 1.4], gap="large")
 
     # =========================
@@ -291,19 +272,13 @@ def main():
         crowd_period = st.selectbox("混雑（時期の目安）", CROWD_PERIOD_OPTIONS, index=0)
         crowd_stars = CROWD_STARS_BY_PERIOD.get(crowd_period, 2)
 
-        group = st.selectbox(
-            "同伴者",
-            ["大人のみ", "子連れ（未就学）", "子連れ（小学校低学年）", "子連れ（小学校高学年）"],
-            index=0,
-        )
-
         wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"], index=1)
         happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
 
         st.divider()
 
         # 「結果」表示エリア（ここに後で流し込む）
-        ph_metric = st.empty()
+        ph_metrics = st.empty()
         ph_buttons = st.empty()
         ph_eval = st.empty()
         st.divider()
@@ -493,14 +468,12 @@ def main():
     limit = (
         crowd_limit_30min_from_stars(crowd_stars)
         * wait_tolerance_factor(wait_tol)
-        * child_modifier(group)
         * perk_modifier(happy)
     )
     ev = evaluate(total_points, limit)
 
-    # LEFT output
-    with ph_metric.container():
-        # ★変更：目安上限を合計点と同じ大きさ（metric）で表示
+    # LEFT output：合計点と目安上限を「同じ大きさ」で表示（st.metric）
+    with ph_metrics.container():
         m1, m2 = st.columns(2)
         with m1:
             st.metric("合計点", f"{total_points:.1f} 点")
@@ -512,11 +485,9 @@ def main():
         with b1:
             if st.button("決定（評価文を表示）", key="btn_confirm_left"):
                 st.session_state["confirmed"] = True
-                _rerun()
         with b2:
             if st.button("選択全解除（点数表）", key="btn_clear_left"):
                 clear_all_selections()
-                _rerun()
 
     with ph_eval.container():
         if st.session_state.get("confirmed", False):
@@ -538,7 +509,7 @@ def main():
         st.text_area(
             " ",
             value=(
-                f"条件：{crowd_period} / {group} / 待ち許容={wait_tol}"
+                f"条件：{crowd_period} / 待ち許容={wait_tol}"
                 + (" / ハッピーエントリーあり" if happy else "")
                 + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
                 + f"\n評価：{ev['label']}\n{ev['message']}"
