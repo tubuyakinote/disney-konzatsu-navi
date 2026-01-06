@@ -73,7 +73,7 @@ def login_gate() -> bool:
 # =========================
 MODE_WAIT = "並ぶ"
 MODE_DPA = "DPA"
-MODE_PP = "PP"
+MODE_PP = "PP"  # 追加
 
 
 # =========================
@@ -81,27 +81,44 @@ MODE_PP = "PP"
 # =========================
 @st.cache_data
 def load_default_attractions() -> pd.DataFrame:
+    """
+    attractions_master.csv をリポジトリに置く想定。
+    列想定：
+      park, attraction, wait, dpa, pp
+    無い場合は最小セットで起動。
+    """
     import os
 
     if os.path.exists("attractions_master.csv"):
         df = pd.read_csv("attractions_master.csv")
+
         for c in ["wait", "dpa", "pp"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        df["park"] = df["park"].astype(str).str.strip()
-        df["attraction"] = df["attraction"].astype(str).str.strip()
-        df = df.drop_duplicates(subset=["park", "attraction"], keep="first")
+        if "park" in df.columns:
+            df["park"] = df["park"].astype(str).str.strip()
+        if "attraction" in df.columns:
+            df["attraction"] = df["attraction"].astype(str).str.strip()
 
+        if "park" in df.columns and "attraction" in df.columns:
+            df = df.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
+
+        # pp列が無い古いCSVでも動くように補完
         if "pp" not in df.columns:
             df["pp"] = pd.NA
 
-        return df.reset_index(drop=True)
+        return df
 
+    # フォールバック
     return pd.DataFrame(
         [
             {"park": "TDS", "attraction": "ソアリン：ファンタスティック・フライト", "wait": 5, "dpa": 4, "pp": pd.NA},
             {"park": "TDS", "attraction": "センター・オブ・ジ・アース", "wait": 4, "dpa": 3, "pp": pd.NA},
+            {"park": "TDS", "attraction": "トイ・ストーリー・マニア！", "wait": 4, "dpa": 3, "pp": pd.NA},
+            {"park": "TDS", "attraction": "タワー・オブ・テラー", "wait": 3, "dpa": 2, "pp": pd.NA},
+            {"park": "TDS", "attraction": "インディ・ジョーンズ・アドベンチャー：クリスタルスカルの魔宮", "wait": 3, "dpa": 2, "pp": pd.NA},
+            {"park": "TDS", "attraction": "アナとエルサのフローズンジャーニー", "wait": 5, "dpa": 5, "pp": pd.NA},
         ]
     )
 
@@ -115,11 +132,15 @@ def child_modifier(group: str) -> float:
         "子連れ（未就学）": 0.85,
         "子連れ（小学校低学年）": 0.90,
         "子連れ（小学校高学年）": 0.95,
-    }[group]
+    }.get(group, 1.00)
 
 
 def perk_modifier(happy_entry: bool) -> float:
-    return 1.15 if happy_entry else 1.00
+    # バケパ削除（ハッピーエントリーのみ）
+    factor = 1.00
+    if happy_entry:
+        factor *= 1.15
+    return factor
 
 
 def wait_tolerance_factor(wait_tolerance: str) -> float:
@@ -131,7 +152,7 @@ def wait_tolerance_factor(wait_tolerance: str) -> float:
 
 
 # =========================
-# Crowd definition（★差し替え）
+# Crowd (UPDATED per your list)
 # =========================
 CROWD_PERIOD_OPTIONS = [
     "1月 上旬（★★★）",
@@ -149,30 +170,92 @@ CROWD_PERIOD_OPTIONS = [
     "7月下旬（★★）",
     "8月上旬（★★）",
     "8月中旬〜下旬（★★★）",
-    "9月初旬〜中旬（★★）",
+    "9月初旬～中旬（★★）",
     "9月中旬〜10月下旬（★★★）",
     "11月上旬（★★）",
     "11月中旬〜12月上旬（★★）",
     "12月中旬〜下旬（★★★）",
 ]
-
 CROWD_STARS_BY_PERIOD = {label: label.count("★") for label in CROWD_PERIOD_OPTIONS}
 
 
 def crowd_limit_30min_from_stars(stars: int) -> float:
-    return {1: 12.0, 2: 9.0, 3: 6.0}[stars]
+    """
+    ★が少ないほど空いている＝許容点（目安上限）は高い
+    """
+    base = {
+        1: 12.0,  # 空いてる
+        2: 9.0,   # ふつう
+        3: 6.0,   # 混む
+    }
+    return base.get(stars, 9.0)
 
 
 def evaluate(total_points: float, limit: float) -> Dict[str, Any]:
     ratio = total_points / limit if limit > 0 else 999
+
     if ratio <= 0.75:
-        return {"label": "かなりラク（余白あり）", "message": "かなり余裕あり。"}
-    elif ratio <= 1.0:
-        return {"label": "だいたいOK", "message": "計画通りなら成立。"}
+        label = "かなりラク（余白あり）"
+        msg = "待ち許容内に収めやすい構成です。ショー/休憩/偶然の寄り道も入れやすい。"
+    elif ratio <= 1.00:
+        label = "だいたいOK（計画通りなら成立）"
+        msg = "目安上限付近です。開園待ち・移動・食事の段取り次第で体感が変わります。"
     elif ratio <= 1.25:
-        return {"label": "けっこう大変", "message": "取捨選択が必要。"}
+        label = "けっこう大変（待ち・妥協が出やすい）"
+        msg = "どこかで待ち時間超過 or 予定変更が起きやすいです。『捨てる候補』を先に決めるのが安全。"
     else:
-        return {"label": "無理寄り", "message": "DPA前提。"}
+        label = "無理寄り（超・計画職人向け）"
+        msg = "この条件だと、待ち許容内を維持するのはかなり厳しめ。DPA/入園アドバンテージ前提に。"
+
+    return {"limit": float(limit), "ratio": ratio, "label": label, "message": msg}
+
+
+def normalize_raw_total(raw_total: float) -> float:
+    # 合計点は補正しない
+    return float(raw_total)
+
+
+# =========================
+# About (txt from same folder)
+# =========================
+def render_about():
+    txt_path = Path(__file__).with_name("点数の考え方.txt")
+    try:
+        body = txt_path.read_text(encoding="utf-8").strip()
+        if not body:
+            body = "（説明文ファイルは読み込めましたが、中身が空です）"
+    except Exception:
+        body = f"（説明文ファイルが見つかりません：{txt_path.name}）\n\n※Streamlit Cloud運用では、リポジトリ直下にこのtxtを置いてください。"
+
+    with st.expander("✍️ 趣旨・仕様・使い方", expanded=True):
+        st.markdown(body.replace("\n", "  \n"))
+
+
+# =========================
+# Selection state
+# =========================
+def _ensure_state():
+    st.session_state.setdefault("confirmed", False)
+    st.session_state.setdefault("selected", {})  # row_key -> mode
+    st.session_state.setdefault("park_filter", "ALL")
+
+
+def _row_id(park: str, attraction: str) -> str:
+    return f"{park}__{attraction}"
+
+
+def toggle_select(row_key: str, mode: str):
+    cur = st.session_state["selected"].get(row_key)
+    if cur == mode:
+        st.session_state["selected"].pop(row_key, None)
+    else:
+        st.session_state["selected"][row_key] = mode
+
+
+def clear_all_selections():
+    st.session_state["selected"] = {}
+    st.session_state["confirmed"] = False
+
 
 # =========================
 # Main
@@ -182,42 +265,287 @@ def main():
 
     if not login_gate():
         st.title(APP_TITLE)
-        st.info("合言葉を入力してください。")
+        st.info("メンバー限定機能です。合言葉を入力してください。")
         return
 
+    _ensure_state()
+
+    # 先に点数表を確実に初期化（右カラムのdownload_buttonで参照するため）
     if "df_points" not in st.session_state:
-        st.session_state["df_points"] = load_default_attractions()
+        st.session_state["df_points"] = load_default_attractions().copy()
 
     st.title(APP_TITLE)
+    render_about()
 
-    col_left, col_right = st.columns([1.0, 1.4])
+    # v4：左右入替
+    #  左：条件/結果
+    #  右：点数表
+    col_left, col_right = st.columns([1.0, 1.4], gap="large")
 
+    # =========================
+    # LEFT: conditions + results (placeholders)
+    # =========================
     with col_left:
-        crowd_period = st.selectbox("混雑（時期の目安）", CROWD_PERIOD_OPTIONS)
-        stars = CROWD_STARS_BY_PERIOD[crowd_period]
+        st.markdown("## 条件（補正）")
 
-        group = st.selectbox("同伴者", ["大人のみ", "子連れ（未就学）", "子連れ（小学校低学年）", "子連れ（小学校高学年）"])
-        wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"])
-        happy = st.checkbox("ハッピーエントリーあり")
+        crowd_period = st.selectbox("混雑（時期の目安）", CROWD_PERIOD_OPTIONS, index=0)
+        crowd_stars = CROWD_STARS_BY_PERIOD.get(crowd_period, 2)
 
-        total_points = 10.0  # ダミー（既存計算ロジックそのまま想定）
-
-        limit = (
-            crowd_limit_30min_from_stars(stars)
-            * wait_tolerance_factor(wait_tol)
-            * child_modifier(group)
-            * perk_modifier(happy)
+        group = st.selectbox(
+            "同伴者",
+            ["大人のみ", "子連れ（未就学）", "子連れ（小学校低学年）", "子連れ（小学校高学年）"],
+            index=0,
         )
 
-        ev = evaluate(total_points, limit)
+        wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"], index=1)
+        happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
 
-        # ★ 合計点＆目安上限を同サイズ表示
+        st.divider()
+
+        # 「結果」表示エリア（ここに後で流し込む）
+        ph_metric = st.empty()
+        ph_buttons = st.empty()
+        ph_eval = st.empty()
+        st.divider()
+        ph_selected = st.empty()
+        ph_copy = st.empty()
+
+    # =========================
+    # RIGHT: points table + filter + editor + CSV IO
+    # =========================
+    with col_right:
+        st.markdown("## 点数表（選ぶ）")
+        st.caption("一覧はスクロールできます。点数もこの画面上で編集できます（自分用カスタム）。")
+
+        # CSV IO
+        with st.expander("（任意）点数表CSVの読み込み/書き出し", expanded=False):
+            up = st.file_uploader("attractions_master.csv をアップロード（上書き）", type=["csv"])
+            if up is not None:
+                df_up = pd.read_csv(up)
+
+                for c in ["wait", "dpa", "pp"]:
+                    if c in df_up.columns:
+                        df_up[c] = pd.to_numeric(df_up[c], errors="coerce")
+                if "pp" not in df_up.columns:
+                    df_up["pp"] = pd.NA
+
+                if "park" in df_up.columns:
+                    df_up["park"] = df_up["park"].astype(str).str.strip()
+                if "attraction" in df_up.columns:
+                    df_up["attraction"] = df_up["attraction"].astype(str).str.strip()
+                if "park" in df_up.columns and "attraction" in df_up.columns:
+                    df_up = df_up.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
+
+                st.session_state["df_points"] = df_up
+                st.success("点数表を読み込みました。")
+
+            st.download_button(
+                "現在の点数表をCSVでダウンロード",
+                st.session_state["df_points"].to_csv(index=False).encode("utf-8-sig"),
+                file_name="attractions_master.csv",
+                mime="text/csv",
+            )
+
+        # Park filter
+        fcol1, fcol2 = st.columns([0.45, 0.55])
+        with fcol1:
+            park_filter = st.selectbox("パーク絞り込み", ["ALL", "TDLのみ", "TDSのみ"], index=0)
+            st.session_state["park_filter"] = park_filter
+
+        # base df
+        df_points = st.session_state["df_points"].copy()
+        for c in ["wait", "dpa", "pp"]:
+            if c not in df_points.columns:
+                df_points[c] = pd.NA
+
+        df_points["wait"] = pd.to_numeric(df_points["wait"], errors="coerce").fillna(0.0)
+        df_points["dpa"] = pd.to_numeric(df_points["dpa"], errors="coerce")
+        df_points["pp"] = pd.to_numeric(df_points["pp"], errors="coerce")
+
+        # view filter
+        df_view = df_points.copy()
+        if park_filter == "TDLのみ":
+            df_view = df_view[df_view["park"] == "TDL"]
+        elif park_filter == "TDSのみ":
+            df_view = df_view[df_view["park"] == "TDS"]
+        df_view = df_view.reset_index(drop=True)
+
+        # header
+        h1, h2, h3, h4, h5 = st.columns([0.12, 0.55, 0.11, 0.11, 0.11])
+        h1.markdown("**パーク**")
+        h2.markdown("**アトラクション**")
+        h3.markdown("**並ぶ（点）**")
+        h4.markdown("**DPA（点）**")
+        h5.markdown("**PP（点）**")
+
+        st.caption("点数セルを押して選択（同一アトラクションは排他。もう一度押すと解除）")
+
+        # scroll container
+        with st.container(height=520):
+            for _, r in df_view.iterrows():
+                park = str(r.get("park", "")).strip()
+                name = str(r.get("attraction", "")).strip()
+                row_key = _row_id(park, name)
+
+                wait_p = float(r["wait"]) if pd.notna(r["wait"]) else 0.0
+                dpa_p = r["dpa"]
+                pp_p = r["pp"]
+
+                selected_mode = st.session_state["selected"].get(row_key)
+
+                c1, c2, c3, c4, c5 = st.columns([0.12, 0.55, 0.11, 0.11, 0.11], vertical_alignment="center")
+                c1.write(park)
+                c2.write(name)
+
+                c3.button(
+                    f"{wait_p:.0f}" if wait_p == int(wait_p) else f"{wait_p}",
+                    key=f"btn_wait__{row_key}",
+                    on_click=toggle_select,
+                    args=(row_key, MODE_WAIT),
+                    type=("primary" if selected_mode == MODE_WAIT else "secondary"),
+                    disabled=(wait_p <= 0),
+                    use_container_width=True,
+                )
+
+                c4.button(
+                    ("—" if pd.isna(dpa_p) else f"{float(dpa_p):.0f}"),
+                    key=f"btn_dpa__{row_key}",
+                    on_click=toggle_select,
+                    args=(row_key, MODE_DPA),
+                    type=("primary" if selected_mode == MODE_DPA else "secondary"),
+                    disabled=pd.isna(dpa_p),
+                    use_container_width=True,
+                )
+
+                c5.button(
+                    ("—" if pd.isna(pp_p) else f"{float(pp_p):.0f}"),
+                    key=f"btn_pp__{row_key}",
+                    on_click=toggle_select,
+                    args=(row_key, MODE_PP),
+                    type=("primary" if selected_mode == MODE_PP else "secondary"),
+                    disabled=pd.isna(pp_p),
+                    use_container_width=True,
+                )
+
+        # editor
+        with st.expander("（任意）点数表を編集する（並ぶ/DPA/PP）", expanded=False):
+            df_edit = df_points.rename(
+                columns={"park": "パーク", "attraction": "アトラクション", "wait": "並ぶ（点）", "dpa": "DPA（点）", "pp": "PP（点）"}
+            )
+            edited = st.data_editor(
+                df_edit,
+                key="points_editor_edit",
+                use_container_width=True,
+                height=420,
+                hide_index=True,
+                column_config={
+                    "パーク": st.column_config.SelectboxColumn("パーク", options=["TDL", "TDS"], width="small"),
+                    "アトラクション": st.column_config.TextColumn("アトラクション", width="large"),
+                    "並ぶ（点）": st.column_config.NumberColumn("並ぶ（点）", min_value=0.0, step=1.0, width="small"),
+                    "DPA（点）": st.column_config.NumberColumn("DPA（点）", width="small"),
+                    "PP（点）": st.column_config.NumberColumn("PP（点）", width="small"),
+                },
+            )
+            back = edited.rename(
+                columns={"パーク": "park", "アトラクション": "attraction", "並ぶ（点）": "wait", "DPA（点）": "dpa", "PP（点）": "pp"}
+            )
+            back["wait"] = pd.to_numeric(back["wait"], errors="coerce").fillna(0.0)
+            back["dpa"] = pd.to_numeric(back["dpa"], errors="coerce")
+            back["pp"] = pd.to_numeric(back["pp"], errors="coerce")
+
+            if not back.equals(st.session_state["df_points"]):
+                st.session_state["df_points"] = back
+                st.success("点数表を更新しました（選択状態は保持されます）。")
+
+    # =========================
+    # Compute + render results on LEFT placeholders
+    # =========================
+    df_points = st.session_state["df_points"].copy()
+    selected = st.session_state["selected"].copy()
+
+    raw_total = 0.0
+    chosen_rows = []
+
+    for row_key, mode in selected.items():
+        try:
+            park, name = row_key.split("__", 1)
+        except ValueError:
+            continue
+
+        match = df_points[(df_points["park"].astype(str) == park) & (df_points["attraction"].astype(str) == name)]
+        if match.empty:
+            continue
+        r = match.iloc[0]
+
+        p = 0.0
+        if mode == MODE_WAIT:
+            p = float(r["wait"]) if pd.notna(r["wait"]) else 0.0
+        elif mode == MODE_DPA:
+            p = float(r["dpa"]) if pd.notna(r["dpa"]) else 0.0
+        elif mode == MODE_PP:
+            p = float(r["pp"]) if pd.notna(r["pp"]) else 0.0
+
+        raw_total += p
+        chosen_rows.append({"パーク": park, "アトラクション": name, "選択": mode, "点": p})
+
+    total_points = normalize_raw_total(raw_total)
+
+    limit = (
+        crowd_limit_30min_from_stars(crowd_stars)
+        * wait_tolerance_factor(wait_tol)
+        * child_modifier(group)
+        * perk_modifier(happy)
+    )
+    ev = evaluate(total_points, limit)
+
+    # LEFT output
+    with ph_metric.container():
+        # ★変更：目安上限を合計点と同じ大きさ（metric）で表示
         m1, m2 = st.columns(2)
-        m1.metric("合計点", f"{total_points:.1f} 点")
-        m2.metric("目安上限", f"{limit:.1f} 点")
+        with m1:
+            st.metric("合計点", f"{total_points:.1f} 点")
+        with m2:
+            st.metric("目安上限", f"{ev['limit']:.1f} 点")
 
-        st.markdown(f"### 評価：{ev['label']}")
-        st.write(ev["message"])
+    with ph_buttons.container():
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("決定（評価文を表示）", key="btn_confirm_left"):
+                st.session_state["confirmed"] = True
+                _rerun()
+        with b2:
+            if st.button("選択全解除（点数表）", key="btn_clear_left"):
+                clear_all_selections()
+                _rerun()
+
+    with ph_eval.container():
+        if st.session_state.get("confirmed", False):
+            st.markdown(f"### 評価：{ev['label']}")
+            st.write(ev["message"])
+        else:
+            st.info("「決定」を押すと、評価とコピペ用文章が表示されます。")
+
+    with ph_selected.container():
+        st.markdown("### 選択内容")
+        if chosen_rows:
+            df_sel = pd.DataFrame(chosen_rows).sort_values(["パーク", "点"], ascending=[True, False])
+            st.dataframe(df_sel, height=240, hide_index=True, use_container_width=True)
+        else:
+            st.caption("まだ何も選択されていません。")
+
+    with ph_copy.container():
+        st.markdown("### 評価文（コピペ用）")
+        st.text_area(
+            " ",
+            value=(
+                f"条件：{crowd_period} / {group} / 待ち許容={wait_tol}"
+                + (" / ハッピーエントリーあり" if happy else "")
+                + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
+                + f"\n評価：{ev['label']}\n{ev['message']}"
+            ),
+            height=140,
+            key="copy_text_left",
+        )
 
 
 if __name__ == "__main__":
