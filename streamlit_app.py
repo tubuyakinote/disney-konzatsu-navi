@@ -2,10 +2,21 @@
 import hashlib
 import hmac
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 import pandas as pd
 import streamlit as st
+
+
+# =========================
+# Utils
+# =========================
+def _rerun():
+    # ※基本は呼ばない（瞬断を増やす原因）
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
 
 APP_TITLE = "ディズニー混雑点数ナビ"
@@ -117,7 +128,7 @@ def load_default_attractions() -> pd.DataFrame:
 # Modifiers / Evaluation
 # =========================
 def perk_modifier(happy_entry: bool) -> float:
-    # バケパ削除（ハッピーエントリーのみ）
+    # ハッピーエントリーのみ
     factor = 1.00
     if happy_entry:
         factor *= 1.15
@@ -132,7 +143,7 @@ def wait_tolerance_factor(wait_tolerance: str) -> float:
     }[wait_tolerance]
 
 
-# ★あなた指定の「混雑（時期の目安）」に差し替え
+# ★①：ユーザー指定の時期リストへ差し替え
 CROWD_PERIOD_OPTIONS = [
     "1月 上旬（★★★）",
     "1月 中旬（★★）",
@@ -194,10 +205,9 @@ def normalize_raw_total(raw_total: float) -> float:
 
 
 # =========================
-# About (txt from same folder)  ※チラつき軽減のためキャッシュ
+# About (txt from same folder)
 # =========================
-@st.cache_data
-def load_about_text() -> str:
+def render_about():
     txt_path = Path(__file__).with_name("点数の考え方.txt")
     try:
         body = txt_path.read_text(encoding="utf-8").strip()
@@ -205,11 +215,7 @@ def load_about_text() -> str:
             body = "（説明文ファイルは読み込めましたが、中身が空です）"
     except Exception:
         body = f"（説明文ファイルが見つかりません：{txt_path.name}）\n\n※Streamlit Cloud運用では、リポジトリ直下にこのtxtを置いてください。"
-    return body
 
-
-def render_about():
-    body = load_about_text()
     with st.expander("✍️ 趣旨・仕様・使い方", expanded=True):
         st.markdown(body.replace("\n", "  \n"))
 
@@ -240,6 +246,35 @@ def clear_all_selections():
     st.session_state["confirmed"] = False
 
 
+def compute_total_and_rows(df_points: pd.DataFrame, selected: Dict[str, str]) -> Tuple[float, List[Dict[str, Any]]]:
+    raw_total = 0.0
+    chosen_rows: List[Dict[str, Any]] = []
+
+    for row_key, mode in selected.items():
+        try:
+            park, name = row_key.split("__", 1)
+        except ValueError:
+            continue
+
+        match = df_points[(df_points["park"].astype(str) == park) & (df_points["attraction"].astype(str) == name)]
+        if match.empty:
+            continue
+        r = match.iloc[0]
+
+        p = 0.0
+        if mode == MODE_WAIT:
+            p = float(r["wait"]) if pd.notna(r["wait"]) else 0.0
+        elif mode == MODE_DPA:
+            p = float(r["dpa"]) if pd.notna(r["dpa"]) else 0.0
+        elif mode == MODE_PP:
+            p = float(r["pp"]) if pd.notna(r["pp"]) else 0.0
+
+        raw_total += p
+        chosen_rows.append({"パーク": park, "アトラクション": name, "選択": mode, "点": p})
+
+    return normalize_raw_total(raw_total), chosen_rows
+
+
 # =========================
 # Main
 # =========================
@@ -260,11 +295,11 @@ def main():
     st.title(APP_TITLE)
     render_about()
 
-    # v4：左右入替
+    # v4：左右
     col_left, col_right = st.columns([1.0, 1.4], gap="large")
 
     # =========================
-    # LEFT: conditions + results (placeholders)
+    # LEFT: conditions + results（先に描画して“瞬断”体感を減らす）
     # =========================
     with col_left:
         st.markdown("## 条件（補正）")
@@ -277,13 +312,70 @@ def main():
 
         st.divider()
 
-        # 「結果」表示エリア（ここに後で流し込む）
-        ph_metrics = st.empty()
-        ph_buttons = st.empty()
-        ph_eval = st.empty()
+        # 計算（現時点の session_state で）
+        df_points_now = st.session_state["df_points"].copy()
+        for c in ["wait", "dpa", "pp"]:
+            if c not in df_points_now.columns:
+                df_points_now[c] = pd.NA
+        df_points_now["wait"] = pd.to_numeric(df_points_now["wait"], errors="coerce").fillna(0.0)
+        df_points_now["dpa"] = pd.to_numeric(df_points_now["dpa"], errors="coerce")
+        df_points_now["pp"] = pd.to_numeric(df_points_now["pp"], errors="coerce")
+
+        total_points, chosen_rows = compute_total_and_rows(df_points_now, st.session_state["selected"])
+
+        limit = (
+            crowd_limit_30min_from_stars(crowd_stars)
+            * wait_tolerance_factor(wait_tol)
+            * perk_modifier(happy)
+        )
+        ev = evaluate(total_points, limit)
+
+        # ★② 目安上限を合計点と同じ大きさに（st.metricで並べる）
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("合計点", f"{total_points:.1f} 点")
+        with m2:
+            st.metric("目安上限", f"{ev['limit']:.1f} 点")
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("決定（評価文を表示）", key="btn_confirm_left"):
+                st.session_state["confirmed"] = True
+                # ※明示的 _rerun() は呼ばない（瞬断軽減）
+        with b2:
+            if st.button("選択全解除（点数表）", key="btn_clear_left"):
+                clear_all_selections()
+                # ※明示的 _rerun() は呼ばない
+
         st.divider()
-        ph_selected = st.empty()
-        ph_copy = st.empty()
+
+        if st.session_state.get("confirmed", False):
+            st.markdown(f"### 評価：{ev['label']}")
+            st.write(ev["message"])
+        else:
+            st.info("「決定」を押すと、評価とコピペ用文章が表示されます。")
+
+        st.divider()
+
+        st.markdown("### 選択内容")
+        if chosen_rows:
+            df_sel = pd.DataFrame(chosen_rows).sort_values(["パーク", "点"], ascending=[True, False])
+            st.dataframe(df_sel, height=240, hide_index=True, use_container_width=True)
+        else:
+            st.caption("まだ何も選択されていません。")
+
+        st.markdown("### 評価文（コピペ用）")
+        st.text_area(
+            " ",
+            value=(
+                f"条件：{crowd_period} / 待ち許容={wait_tol}"
+                + (" / ハッピーエントリーあり" if happy else "")
+                + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
+                + f"\n評価：{ev['label']}\n{ev['message']}"
+            ),
+            height=140,
+            key="copy_text_left",
+        )
 
     # =========================
     # RIGHT: points table + filter + editor + CSV IO
@@ -313,6 +405,8 @@ def main():
 
                 st.session_state["df_points"] = df_up
                 st.success("点数表を読み込みました。")
+                # ※ここは読み込み直後の反映が重要なので rerun 推奨
+                _rerun()
 
             st.download_button(
                 "現在の点数表をCSVでダウンロード",
@@ -431,92 +525,8 @@ def main():
             if not back.equals(st.session_state["df_points"]):
                 st.session_state["df_points"] = back
                 st.success("点数表を更新しました（選択状態は保持されます）。")
-
-    # =========================
-    # Compute + render results on LEFT placeholders
-    # =========================
-    df_points = st.session_state["df_points"].copy()
-    selected = st.session_state["selected"].copy()
-
-    raw_total = 0.0
-    chosen_rows = []
-
-    for row_key, mode in selected.items():
-        try:
-            park, name = row_key.split("__", 1)
-        except ValueError:
-            continue
-
-        match = df_points[(df_points["park"].astype(str) == park) & (df_points["attraction"].astype(str) == name)]
-        if match.empty:
-            continue
-        r = match.iloc[0]
-
-        p = 0.0
-        if mode == MODE_WAIT:
-            p = float(r["wait"]) if pd.notna(r["wait"]) else 0.0
-        elif mode == MODE_DPA:
-            p = float(r["dpa"]) if pd.notna(r["dpa"]) else 0.0
-        elif mode == MODE_PP:
-            p = float(r["pp"]) if pd.notna(r["pp"]) else 0.0
-
-        raw_total += p
-        chosen_rows.append({"パーク": park, "アトラクション": name, "選択": mode, "点": p})
-
-    total_points = normalize_raw_total(raw_total)
-
-    limit = (
-        crowd_limit_30min_from_stars(crowd_stars)
-        * wait_tolerance_factor(wait_tol)
-        * perk_modifier(happy)
-    )
-    ev = evaluate(total_points, limit)
-
-    # LEFT output：合計点と目安上限を「同じ大きさ」で表示（st.metric）
-    with ph_metrics.container():
-        m1, m2 = st.columns(2)
-        with m1:
-            st.metric("合計点", f"{total_points:.1f} 点")
-        with m2:
-            st.metric("目安上限", f"{ev['limit']:.1f} 点")
-
-    with ph_buttons.container():
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button("決定（評価文を表示）", key="btn_confirm_left"):
-                st.session_state["confirmed"] = True
-        with b2:
-            if st.button("選択全解除（点数表）", key="btn_clear_left"):
-                clear_all_selections()
-
-    with ph_eval.container():
-        if st.session_state.get("confirmed", False):
-            st.markdown(f"### 評価：{ev['label']}")
-            st.write(ev["message"])
-        else:
-            st.info("「決定」を押すと、評価とコピペ用文章が表示されます。")
-
-    with ph_selected.container():
-        st.markdown("### 選択内容")
-        if chosen_rows:
-            df_sel = pd.DataFrame(chosen_rows).sort_values(["パーク", "点"], ascending=[True, False])
-            st.dataframe(df_sel, height=240, hide_index=True, use_container_width=True)
-        else:
-            st.caption("まだ何も選択されていません。")
-
-    with ph_copy.container():
-        st.markdown("### 評価文（コピペ用）")
-        st.text_area(
-            " ",
-            value=(
-                f"条件：{crowd_period} / 待ち許容={wait_tol}"
-                + (" / ハッピーエントリーあり" if happy else "")
-                + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
-                + f"\n評価：{ev['label']}\n{ev['message']}"
-            ),
-            height=140,
-            key="copy_text_left",
-        )
+                # 編集結果は即反映したいので rerun
+                _rerun()
 
 
 if __name__ == "__main__":
