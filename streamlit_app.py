@@ -1,293 +1,1053 @@
-# sim_core.py
 # -*- coding: utf-8 -*-
-from __future__ import annotations
+import hashlib
+import hmac
+from pathlib import Path
+from typing import Dict, Any, List, Tuple, Optional
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-import math
 import pandas as pd
+import streamlit as st
 
 
-# =========
-# Time utils
-# =========
-OPEN_MIN = 9 * 60
-CLOSE_MIN = 21 * 60
+APP_TITLE = "ディズニー混雑点数ナビ"
+SECRET_KEY_NAME = "APP_PASSPHRASE_HASH"
 
-def hhmm(tmin: int) -> str:
-    h = tmin // 60
-    m = tmin % 60
-    return f"{h:02d}:{m:02d}"
-
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-def hour_bucket_from_min(tmin: int) -> int:
-    """09:00〜21:59 を 9〜21 に丸める"""
-    h = tmin // 60
-    return int(clamp(h, 9, 21))
+# Selection modes
+MODE_WAIT = "並ぶ"
+MODE_DPA = "DPA"
+MODE_PP = "PP"
 
 
-# =========
-# Data models
-# =========
-@dataclass
-class AttractionPlan:
-    park: str
-    attraction: str
-    mode: str  # "並ぶ" / "DPA" / "PP"
-
-@dataclass
-class Action:
-    start_min: int
-    end_min: int
-    kind: str  # "MOVE" / "WAIT" / "RIDE" / "DPA_BOOK" / "PP_GET" etc
-    park: str
-    attraction: str
-    note: str = ""
+# =========================
+# Auth
+# =========================
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-# =========
-# CSV loaders
-# =========
-def load_wait_csv(path: str, date_id: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df = df[df["date_id"].astype(str) == str(date_id)].copy()
-    # expected: hour_09..hour_21 in minutes
-    return df
+def verify_passphrase(passphrase: str) -> bool:
+    expected = ""
+    try:
+        expected = st.secrets.get("PASSWORD_SHA256", "")
+        if not expected:
+            expected = st.secrets.get(SECRET_KEY_NAME, "")
+    except Exception:
+        expected = ""
 
-def load_sellout_csv(path: str, date_id: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df = df[df["date_id"].astype(str) == str(date_id)].copy()
-    # columns: date_id, park, attraction, mode, last_bookable_hour
-    return df
-
-def load_factor_csv(path: str) -> pd.DataFrame:
-    # optional
-    return pd.read_csv(path)
-
-
-# =========
-# Wait time query
-# =========
-def get_wait_minutes(wait_df: pd.DataFrame, park: str, attraction: str, tmin: int) -> int:
-    h = hour_bucket_from_min(tmin)
-    col = f"hour_{h:02d}"
-    r = wait_df[(wait_df["park"] == park) & (wait_df["attraction"] == attraction)]
-    if r.empty or col not in r.columns:
-        return 0
-    v = r.iloc[0][col]
-    if pd.isna(v):
-        return 0
-    return int(float(v))
-
-
-def get_last_bookable_hour(sellout_df: pd.DataFrame, park: str, attraction: str, mode: str) -> Optional[int]:
-    r = sellout_df[(sellout_df["park"] == park) & (sellout_df["attraction"] == attraction) & (sellout_df["mode"] == mode)]
-    if r.empty:
-        return None
-    v = r.iloc[0].get("last_bookable_hour", None)
-    if pd.isna(v):
-        return None
-    return int(v)
-
-
-# =========
-# DPA/PP availability (simple)
-# =========
-def next_available_slot_min(now_min: int, last_bookable_hour: Optional[int]) -> Optional[int]:
-    """
-    簡易： '今の時間の枠' がまだ買えるなら now の時間枠（=その時刻）とみなす。
-    だめなら次の時間枠（+60分単位）。
-    last_bookable_hour は「その時間台まで新規取得可能」。超えたら None。
-    """
-    if last_bookable_hour is None:
-        return None
-
-    now_h = hour_bucket_from_min(now_min)
-    if now_h > last_bookable_hour:
-        return None
-
-    # まず「今すぐ枠」を候補
-    # （実データ化するときは、ここを “在庫テーブル” に差し替える）
-    return now_min
-
-
-# =========
-# Scheduler core
-# =========
-def simulate_day(
-    plans: List[AttractionPlan],
-    wait_df: pd.DataFrame,
-    sellout_df: pd.DataFrame,
-    interval_min: int = 10,
-    ride_duration_min: int = 15,
-    move_duration_min: int = 10,
-) -> Tuple[List[Action], List[AttractionPlan]]:
-    """
-    返り値:
-      actions: タイムライン
-      remaining: 時間切れ等で実行できなかった残り
-    """
-    remaining = plans.copy()
-    actions: List[Action] = []
-
-    now = OPEN_MIN
-
-    # 次にDPA/PPを取れる時刻（権利復活）
-    next_dpa_ok = OPEN_MIN
-    next_pp_ok = OPEN_MIN
-
-    # 予約済み（未来枠）の保持
-    booked: List[Tuple[str, str, str, int]] = []  # (park, attraction, mode, slot_min)
-
-    def can_do_now(p: AttractionPlan) -> bool:
-        if p.mode == "並ぶ":
-            return True
-        if p.mode == "DPA":
-            return now >= next_dpa_ok and next_available_slot_min(now, get_last_bookable_hour(sellout_df, p.park, p.attraction, "DPA")) is not None
-        if p.mode == "PP":
-            return now >= next_pp_ok and next_available_slot_min(now, get_last_bookable_hour(sellout_df, p.park, p.attraction, "PP")) is not None
+    if not expected:
+        st.error(
+            "ログイン用の設定（Secrets）が見つかりません。\n\n"
+            "ローカルで動かす場合は、このプロジェクト直下に `.streamlit/secrets.toml` を作成し、\n"
+            'PASSWORD_SHA256="(sha256)"\n'
+            "または\n"
+            f'{SECRET_KEY_NAME}="(sha256)"\n'
+            "の形式で保存してください。"
+        )
         return False
 
-    def score_candidate(p: AttractionPlan) -> float:
-        """
-        小さいほど優先（貪欲）。
-        - 今の待ちが小さいほど良い
-        - DPA/PP は売切が近いほど優先（last_bookable_hourが小さいほど）
-        """
-        base = 0.0
-        if p.mode == "並ぶ":
-            base += get_wait_minutes(wait_df, p.park, p.attraction, now)
-        elif p.mode == "DPA":
-            last_h = get_last_bookable_hour(sellout_df, p.park, p.attraction, "DPA")
-            # 売切近いほど優先: 残り時間台を小さく
-            base += 20.0
-            if last_h is not None:
-                base += max(0, (last_h - hour_bucket_from_min(now))) * 3.0
-        elif p.mode == "PP":
-            last_h = get_last_bookable_hour(sellout_df, p.park, p.attraction, "PP")
-            base += 15.0
-            if last_h is not None:
-                base += max(0, (last_h - hour_bucket_from_min(now))) * 3.0
-        return base
+    got = sha256_hex(passphrase.strip())
+    return hmac.compare_digest(got, str(expected).strip())
 
-    while now < CLOSE_MIN and remaining:
-        # 1) 予約済み未来枠が「今すぐ使える」になってたら優先消化
-        usable_idx = None
-        for i, (park, name, mode, slot_min) in enumerate(booked):
-            if slot_min <= now:
-                usable_idx = i
+
+def login_gate() -> bool:
+    with st.sidebar:
+        st.markdown("## 🔒 メンバー限定ログイン")
+        passphrase = st.text_input("合言葉", type="password")
+        ok = st.button("ログイン")
+
+    if ok:
+        st.session_state["auth_ok"] = bool(verify_passphrase(passphrase))
+        if not st.session_state["auth_ok"]:
+            st.warning("合言葉が違います。")
+
+    return bool(st.session_state.get("auth_ok", False))
+
+
+# =========================
+# Files / CSV loader
+# =========================
+def _candidate_paths(filename: str) -> List[Path]:
+    """
+    Streamlit Cloud/ローカル/この実行環境 で見つけやすい順に探索
+    """
+    here = Path(__file__).resolve().parent
+    return [
+        here / filename,
+        Path.cwd() / filename,
+        Path("/mnt/data") / filename,  # このチャット環境用（ユーザー側では不要）
+    ]
+
+
+def read_csv_safely(filename: str) -> Optional[pd.DataFrame]:
+    for p in _candidate_paths(filename):
+        if p.exists():
+            return pd.read_csv(p)
+    return None
+
+
+# =========================
+# About
+# =========================
+def render_about():
+    txt_path = Path(__file__).with_name("点数の考え方.txt")
+    try:
+        body = txt_path.read_text(encoding="utf-8").strip()
+        if not body:
+            body = "（説明文ファイルは読み込めましたが、中身が空です）"
+    except Exception:
+        body = f"（説明文ファイルが見つかりません：{txt_path.name}）\n\n※streamlit_app.py と同じフォルダに置いてください。"
+
+    with st.expander("✍️ 趣旨・仕様・使い方", expanded=True):
+        st.markdown(body.replace("\n", "  \n"))
+
+
+# =========================
+# Default points table
+# =========================
+@st.cache_data
+def load_default_attractions_points() -> pd.DataFrame:
+    """
+    attractions_master.csv（点数表）
+    列想定：park, attraction, wait, dpa, pp
+    """
+    import os
+
+    if os.path.exists("attractions_master.csv"):
+        df = pd.read_csv("attractions_master.csv")
+        for c in ["wait", "dpa", "pp"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        if "park" in df.columns:
+            df["park"] = df["park"].astype(str).str.strip()
+        if "attraction" in df.columns:
+            df["attraction"] = df["attraction"].astype(str).str.strip()
+        if "park" in df.columns and "attraction" in df.columns:
+            df = df.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
+        if "pp" not in df.columns:
+            df["pp"] = pd.NA
+        return df
+
+    # fallback
+    return pd.DataFrame(
+        [
+            {"park": "TDS", "attraction": "ソアリン：ファンタスティック・フライト", "wait": 5, "dpa": 4, "pp": pd.NA},
+            {"park": "TDS", "attraction": "センター・オブ・ジ・アース", "wait": 4, "dpa": 3, "pp": pd.NA},
+            {"park": "TDS", "attraction": "トイ・ストーリー・マニア！", "wait": 4, "dpa": 3, "pp": pd.NA},
+            {"park": "TDS", "attraction": "タワー・オブ・テラー", "wait": 3, "dpa": 2, "pp": pd.NA},
+            {"park": "TDS", "attraction": "インディ・ジョーンズ・アドベンチャー：クリスタルスカルの魔宮", "wait": 3, "dpa": 2, "pp": pd.NA},
+            {"park": "TDS", "attraction": "アナとエルサのフローズンジャーニー", "wait": 5, "dpa": 5, "pp": pd.NA},
+        ]
+    )
+
+
+# =========================
+# Crowd options (user-defined)
+# =========================
+CROWD_PERIOD_OPTIONS = [
+    "1月 上旬（★★★）",
+    "1月 中旬（★★）",
+    "1月 下旬（★）",
+    "2月（★）",
+    "3月上旬（★★）",
+    "3月中旬〜下旬（★★★）",
+    "4月上旬（★★★）",
+    "4月中旬〜下旬（★）",
+    "5月上旬（★★★）",
+    "5月中旬〜下旬（★）",
+    "6月（★）",
+    "7月上旬〜中旬（★）",
+    "7月下旬（★★）",
+    "8月上旬（★★）",
+    "8月中旬〜下旬（★★★）",
+    "9月初旬～中旬（★★）",
+    "9月中旬〜10月下旬（★★★）",
+    "11月上旬（★★）",
+    "11月中旬〜12月上旬（★★）",
+    "12月中旬〜下旬（★★★）",
+]
+CROWD_STARS_BY_PERIOD = {label: label.count("★") for label in CROWD_PERIOD_OPTIONS}
+
+
+def wait_tolerance_factor(wait_tolerance: str) -> float:
+    return {"30分まで": 1.00, "60分まで": 1.25, "90分まで": 1.45}[wait_tolerance]
+
+
+def perk_modifier(happy_entry: bool) -> float:
+    factor = 1.00
+    if happy_entry:
+        factor *= 1.15
+    return factor
+
+
+def crowd_limit_30min_from_stars(stars: int) -> float:
+    base = {1: 12.0, 2: 9.0, 3: 6.0}
+    return base.get(stars, 9.0)
+
+
+def evaluate(total_points: float, limit: float) -> Dict[str, Any]:
+    ratio = total_points / limit if limit > 0 else 999
+    if ratio <= 0.75:
+        label = "かなりラク（余白あり）"
+        msg = "待ち許容内に収めやすい構成です。ショー/休憩/偶然の寄り道も入れやすい。"
+    elif ratio <= 1.00:
+        label = "だいたいOK（計画通りなら成立）"
+        msg = "目安上限付近です。開園待ち・移動・食事の段取り次第で体感が変わります。"
+    elif ratio <= 1.25:
+        label = "けっこう大変（待ち・妥協が出やすい）"
+        msg = "どこかで待ち時間超過 or 予定変更が起きやすいです。『捨てる候補』を先に決めるのが安全。"
+    else:
+        label = "無理寄り（超・計画職人向け）"
+        msg = "この条件だと、待ち許容内を維持するのはかなり厳しめ。DPA/入園アドバンテージ前提に。"
+    return {"limit": float(limit), "ratio": ratio, "label": label, "message": msg}
+
+
+# =========================
+# Selection state
+# =========================
+def _ensure_state():
+    st.session_state.setdefault("confirmed", False)
+    st.session_state.setdefault("selected", {})  # row_key -> mode
+    st.session_state.setdefault("park_filter", "ALL")
+    st.session_state.setdefault("plan_confirmed", False)  # 計画表示用（別管理）
+
+
+def _row_id(park: str, attraction: str) -> str:
+    return f"{park}__{attraction}"
+
+
+def toggle_select(row_key: str, mode: str):
+    cur = st.session_state["selected"].get(row_key)
+    if cur == mode:
+        st.session_state["selected"].pop(row_key, None)
+    else:
+        st.session_state["selected"][row_key] = mode
+
+
+def clear_all_selections():
+    st.session_state["selected"] = {}
+    st.session_state["confirmed"] = False
+    st.session_state["plan_confirmed"] = False
+
+
+# =========================
+# Convert selected -> plans
+# =========================
+def selected_to_plans(df_points: pd.DataFrame, selected: Dict[str, str]) -> List[Dict[str, Any]]:
+    plans: List[Dict[str, Any]] = []
+    for row_key, mode in selected.items():
+        try:
+            park, name = row_key.split("__", 1)
+        except ValueError:
+            continue
+        match = df_points[(df_points["park"].astype(str) == park) & (df_points["attraction"].astype(str) == name)]
+        if match.empty:
+            continue
+        r = match.iloc[0]
+        plans.append(
+            {
+                "park": park,
+                "attraction": name,
+                "mode": mode,
+                "points_wait": float(r["wait"]) if pd.notna(r.get("wait", pd.NA)) else 0.0,
+                "points_dpa": float(r["dpa"]) if pd.notna(r.get("dpa", pd.NA)) else None,
+                "points_pp": float(r["pp"]) if pd.notna(r.get("pp", pd.NA)) else None,
+            }
+        )
+    return plans
+
+
+# =========================
+# Wait CSV (minutes per hour) / Sellout / Factor
+# =========================
+def _parse_hour_columns(cols: List[str]) -> List[int]:
+    """
+    wait CSV想定: hour_09, hour_10 ... hour_21
+    ただしテンプレの列名が崩れても末尾の数字から拾えるようにする
+    """
+    hours = []
+    for c in cols:
+        if c.startswith("hour_"):
+            import re
+
+            m = re.findall(r"(\d{1,2})", c)
+            if m:
+                h = int(m[-1])
+                if 0 <= h <= 23:
+                    hours.append(h)
+    hours = sorted(list(set(hours)))
+    return [h for h in hours if 9 <= h <= 21]
+
+
+def load_wait_table_minutes(dataset_id: str) -> pd.DataFrame:
+    """
+    wait_{dataset_id}.csv
+    columns: park, attraction, hour_09..hour_21 (minutes)
+    """
+    fn = f"wait_{dataset_id}.csv"
+    df = read_csv_safely(fn)
+    if df is None:
+        return pd.DataFrame(columns=["park", "attraction"])
+
+    # normalize
+    for c in ["park", "attraction"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    hour_cols = _parse_hour_columns(list(df.columns))
+    # numeric
+    for h in hour_cols:
+        # find matching col (best-effort)
+        candidates = [c for c in df.columns if c.startswith("hour_") and str(h) in c]
+        col = None
+        # prefer exact
+        for c in candidates:
+            if c in (f"hour_{h:02d}", f"hour_{h}"):
+                col = c
                 break
-        if usable_idx is not None:
-            park, name, mode, slot_min = booked.pop(usable_idx)
+        if col is None and candidates:
+            col = candidates[0]
+        if col is not None:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            # MOVE
-            actions.append(Action(now, now + move_duration_min, "MOVE", park, name, "移動"))
-            now += move_duration_min
+    return df
 
-            # RIDE
-            actions.append(Action(now, now + ride_duration_min, "RIDE", park, name, f"{mode} 利用"))
-            now += ride_duration_min
 
-            # 「すぐ使えた」扱い → 権利復活
-            if mode == "DPA":
-                next_dpa_ok = now
-            elif mode == "PP":
-                next_pp_ok = now
+def load_sellout_table(dataset_id: str) -> pd.DataFrame:
+    """
+    sellout_{dataset_id}.csv
+    columns: park, attraction, dpa_sellout_hour, pp_sellout_hour
+    """
+    fn = f"sellout_{dataset_id}.csv"
+    df = read_csv_safely(fn)
+    if df is None:
+        return pd.DataFrame(columns=["park", "attraction", "dpa_sellout_hour", "pp_sellout_hour"])
 
+    for c in ["park", "attraction"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    for c in ["dpa_sellout_hour", "pp_sellout_hour"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df
+
+
+def load_factor_table(dataset_id: str) -> pd.DataFrame:
+    """
+    factor_{dataset_id}.csv
+    columns (expected):
+      park, attraction,
+      dpa_sellout_speed, pp_sellout_speed,
+      wait_multiplier_morning, wait_multiplier_noon, wait_multiplier_evening
+    """
+    fn = f"factor_{dataset_id}.csv"
+    df = read_csv_safely(fn)
+    if df is None:
+        return pd.DataFrame(columns=["park", "attraction"])
+
+    for c in ["park", "attraction"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    # best-effort: numeric conversions for known-ish columns
+    for c in df.columns:
+        if "sellout_speed" in c or c.startswith("wait_multiplier_"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df
+
+
+def factor_wait_multiplier(df_factor: pd.DataFrame, park: str, attraction: str, hour: int) -> float:
+    """
+    morning/noon/evening の簡易係数
+    morning: 9-11
+    noon: 12-17
+    evening: 18-21
+    """
+    # defaults
+    wm = 1.00
+    wn = 1.15
+    we = 0.90
+
+    if not df_factor.empty:
+        m = df_factor[(df_factor["park"].astype(str) == park) & (df_factor["attraction"].astype(str) == attraction)]
+        if not m.empty:
+            r = m.iloc[0]
+            # 欲しい列名が崩れてても拾えるように、部分一致で探す
+            def pick(prefix: str, default: float) -> float:
+                cols = [c for c in df_factor.columns if c.startswith(prefix)]
+                if cols:
+                    v = r.get(cols[0], default)
+                    return float(v) if pd.notna(v) else default
+                return default
+
+            wm = pick("wait_multiplier_morning", wm)
+            wn = pick("wait_multiplier_noon", wn)
+            we = pick("wait_multiplier_evening", we)
+
+    if 9 <= hour <= 11:
+        return wm
+    if 12 <= hour <= 17:
+        return wn
+    return we
+
+
+def factor_sellout_speed(df_factor: pd.DataFrame, park: str, attraction: str, mode: str) -> float:
+    """
+    混雑★★★ほど早く枠が消える、等の「なくなり速度係数」
+    DPA/PPで係数列を分ける想定。無ければ1.0
+    """
+    if df_factor.empty:
+        return 1.00
+    m = df_factor[(df_factor["park"].astype(str) == park) & (df_factor["attraction"].astype(str) == attraction)]
+    if m.empty:
+        return 1.00
+    r = m.iloc[0]
+    if mode == MODE_DPA:
+        cols = [c for c in df_factor.columns if "dpa_sellout_speed" in c]
+        if cols:
+            v = r.get(cols[0], 1.0)
+            return float(v) if pd.notna(v) else 1.0
+    if mode == MODE_PP:
+        cols = [c for c in df_factor.columns if "pp_sellout_speed" in c]
+        if cols:
+            v = r.get(cols[0], 1.0)
+            return float(v) if pd.notna(v) else 1.0
+    return 1.00
+
+
+def get_wait_minutes(df_wait: pd.DataFrame, park: str, attraction: str, hour: int) -> float:
+    """
+    df_wait: park, attraction, hour_09..hour_21 (minutes)
+    """
+    if df_wait.empty:
+        return 30.0  # fallback
+    m = df_wait[(df_wait["park"].astype(str) == park) & (df_wait["attraction"].astype(str) == attraction)]
+    if m.empty:
+        return 30.0
+    r = m.iloc[0]
+
+    # find a column for this hour
+    candidates = [c for c in df_wait.columns if c.startswith("hour_") and str(hour) in c]
+    col = None
+    for c in candidates:
+        if c in (f"hour_{hour:02d}", f"hour_{hour}"):
+            col = c
+            break
+    if col is None and candidates:
+        col = candidates[0]
+
+    if col is None:
+        return 30.0
+
+    v = r.get(col, 30.0)
+    try:
+        return float(v) if pd.notna(v) else 30.0
+    except Exception:
+        return 30.0
+
+
+def get_sellout_hour(df_sellout: pd.DataFrame, park: str, attraction: str, mode: str) -> Optional[int]:
+    """
+    sellout_hour: 例) 13 => 13:00頃にはもう無い（購入時刻が13以上なら不可）
+    """
+    if df_sellout.empty:
+        return None
+    m = df_sellout[(df_sellout["park"].astype(str) == park) & (df_sellout["attraction"].astype(str) == attraction)]
+    if m.empty:
+        return None
+    r = m.iloc[0]
+    col = "dpa_sellout_hour" if mode == MODE_DPA else "pp_sellout_hour"
+    if col not in df_sellout.columns:
+        return None
+    v = r.get(col, None)
+    if pd.isna(v):
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+# =========================
+# Simple simulation (skeleton, but executable)
+# =========================
+def minutes_to_hhmm(min_from_open: int, open_hour: int = 9) -> str:
+    total = open_hour * 60 + min_from_open
+    h = total // 60
+    m = total % 60
+    return f"{h:02d}:{m:02d}"
+
+
+def hour_from_min(min_from_open: int, open_hour: int = 9) -> int:
+    return (open_hour * 60 + min_from_open) // 60
+
+
+def build_schedule(
+    plans: List[Dict[str, Any]],
+    df_wait: pd.DataFrame,
+    df_sellout: pd.DataFrame,
+    df_factor: pd.DataFrame,
+    crowd_stars: int,
+    interval_min: int,
+    open_hour: int = 9,
+    close_hour: int = 21,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    ざっくり骨組み：
+    - WAIT は「その時刻の待ち(分) × 時間帯係数」を使って所要時間にする
+    - DPA は「売切れ時刻」と「60分ルール」を反映して、最短枠を取りに行く
+    - PP  は「売切れ時刻」と「120分ルール」＋「時間選択不可（最短枠）」を反映
+    - できるだけ早く“消える”ものを先に確保する（簡易の貪欲）
+    """
+    notes: List[str] = []
+
+    # operate minutes from open
+    T_OPEN = 0
+    T_CLOSE = (close_hour - open_hour) * 60
+
+    # internal state
+    tasks = []
+    for p in plans:
+        tasks.append(
+            {
+                "park": p["park"],
+                "attraction": p["attraction"],
+                "mode": p["mode"],
+                "status": "todo",       # todo/booked/done
+                "return_min": None,     # for DPA/PP
+            }
+        )
+
+    # rights
+    next_dpa_buy_min = 0
+    next_pp_get_min = 0
+
+    # helper: crowd affects sellout "effective hour"
+    # ★★★ほど早く消える：stars=3 を基準に、starsが少ないほど遅くなる（ゆるい補正）
+    # 例: ★★★: 1.00, ★★: 0.90, ★: 0.80
+    crowd_speed = {3: 1.00, 2: 0.90, 1: 0.80}.get(crowd_stars, 0.90)
+
+    timeline = []
+    t = 0
+    ride_base_min = 15  # 乗車+出入口などの最低時間（仮）
+
+    def add_event(start_min: int, dur_min: int, task: Dict[str, Any], note: str = ""):
+        end_min = min(start_min + dur_min, T_CLOSE)
+        timeline.append(
+            {
+                "開始": minutes_to_hhmm(start_min, open_hour),
+                "終了": minutes_to_hhmm(end_min, open_hour),
+                "パーク": task["park"],
+                "アトラクション": task["attraction"],
+                "手段": task["mode"],
+                "メモ": note,
+            }
+        )
+        return end_min
+
+    def find_booked_ready(now_min: int) -> Optional[int]:
+        idx = None
+        best_return = 10**9
+        for i, task in enumerate(tasks):
+            if task["status"] == "booked" and task["return_min"] is not None and task["return_min"] <= now_min:
+                if task["return_min"] < best_return:
+                    best_return = task["return_min"]
+                    idx = i
+        return idx
+
+    def earliest_possible_return_min(task: Dict[str, Any], now_min: int) -> Optional[int]:
+        now_hour = hour_from_min(now_min, open_hour)
+        sellout_hour_raw = get_sellout_hour(df_sellout, task["park"], task["attraction"], task["mode"])
+        sp = factor_sellout_speed(df_factor, task["park"], task["attraction"], task["mode"])
+        # effective sellout hour (smaller => earlier sellout)
+        if sellout_hour_raw is None:
+            sellout_hour_eff = None
+        else:
+            # 混雑と係数で売切れが早まる（簡易）
+            sellout_hour_eff = int(round(sellout_hour_raw / max(0.2, crowd_speed * sp)))
+
+        # if sold out already
+        if sellout_hour_eff is not None and now_hour >= sellout_hour_eff:
+            return None
+
+        # DPA: 時間選択の自由あり→最短で “今の時間枠” を狙い、ダメなら次の時間へ
+        # PP : 時間選択不可 → 常に最短枠（今枠→次枠…）
+        # 今回はどちらも「最短枠」を返す（骨組み）
+        cand_hour = now_hour
+        while cand_hour <= close_hour:
+            if sellout_hour_eff is not None and cand_hour >= sellout_hour_eff:
+                return None
+            # return time = cand_hour:00
+            cand_min = (cand_hour - open_hour) * 60
+            if cand_min < T_OPEN:
+                cand_min = T_OPEN
+            # already past this hour start -> allow immediate use if we're within this hour
+            # (骨組みなので「同一時間なら即利用可」とする)
+            if cand_hour == now_hour:
+                return now_min  # "今すぐ"
+            return cand_min
+        return None
+
+    def book_one(now_min: int, mode: str) -> Optional[str]:
+        nonlocal next_dpa_buy_min, next_pp_get_min
+
+        # pick a task to book: earliest sellout / fastest speed
+        candidates = [task for task in tasks if task["status"] == "todo" and task["mode"] == mode]
+        if not candidates:
+            return None
+
+        # scoring: smaller sellout hour first, then bigger speed first
+        def score(task: Dict[str, Any]) -> Tuple[int, float]:
+            s = get_sellout_hour(df_sellout, task["park"], task["attraction"], mode)
+            if s is None:
+                s = 99
+            sp = factor_sellout_speed(df_factor, task["park"], task["attraction"], mode)
+            return (s, -sp)
+
+        candidates_sorted = sorted(candidates, key=score)
+        task = candidates_sorted[0]
+
+        ret = earliest_possible_return_min(task, now_min)
+        if ret is None:
+            task["status"] = "done"
+            return f"{task['attraction']}：{mode}枠が見つからず（売切れ想定）"
+        task["status"] = "booked"
+        task["return_min"] = ret
+
+        # right return rule
+        if mode == MODE_DPA:
+            # すぐ使えるなら、使った後すぐ戻る扱い（=ここでは booked なので戻さない）
+            # すぐ使えない場合、購入権は60分後に復活
+            if ret > now_min:
+                next_dpa_buy_min = max(next_dpa_buy_min, now_min + 60)
+        else:
+            if ret > now_min:
+                next_pp_get_min = max(next_pp_get_min, now_min + 120)
+
+        return f"{mode}確保：{task['attraction']}（{minutes_to_hhmm(ret, open_hour)}〜想定）"
+
+    def do_booked(task: Dict[str, Any], now_min: int) -> int:
+        nonlocal next_dpa_buy_min, next_pp_get_min
+
+        # execute
+        start_min = now_min
+        dur = ride_base_min + interval_min
+        end_min = add_event(start_min, dur, task, note="確保枠を消化")
+        task["status"] = "done"
+        task["return_min"] = None
+
+        # rights: "すぐ使えばすぐ戻る" をここで反映
+        if task["mode"] == MODE_DPA:
+            next_dpa_buy_min = min(next_dpa_buy_min, end_min)  # 使ったら即戻る（概念上）
+        if task["mode"] == MODE_PP:
+            next_pp_get_min = min(next_pp_get_min, end_min)
+
+        return end_min
+
+    def do_wait(task: Dict[str, Any], now_min: int) -> int:
+        hour = hour_from_min(now_min, open_hour)
+        wait_min = get_wait_minutes(df_wait, task["park"], task["attraction"], hour)
+        mult = factor_wait_multiplier(df_factor, task["park"], task["attraction"], hour)
+        dur = int(round(wait_min * mult)) + ride_base_min + interval_min
+        end_min = add_event(now_min, dur, task, note=f"待ち={wait_min:.0f}分×係数{mult:.2f}")
+        task["status"] = "done"
+        return end_min
+
+    def next_booked_return_min() -> Optional[int]:
+        mins = [t["return_min"] for t in tasks if t["status"] == "booked" and t["return_min"] is not None]
+        return min(mins) if mins else None
+
+    # main loop
+    while t < T_CLOSE:
+        # 1) if any booked is ready -> do it
+        idx = find_booked_ready(t)
+        if idx is not None:
+            t = do_booked(tasks[idx], t)
             continue
 
-        # 2) 今すぐ実行できる候補から選ぶ
-        doable = [p for p in remaining if can_do_now(p)]
-        if doable:
-            doable.sort(key=score_candidate)
-            pick = doable[0]
+        # 2) try to book DPA/PP if rights available
+        booked_note = None
+        if t >= next_dpa_buy_min:
+            booked_note = book_one(t, MODE_DPA)
+            if booked_note:
+                notes.append(booked_note)
+        if t >= next_pp_get_min:
+            booked_note2 = book_one(t, MODE_PP)
+            if booked_note2:
+                notes.append(booked_note2)
 
-            if pick.mode == "並ぶ":
-                w = get_wait_minutes(wait_df, pick.park, pick.attraction, now)
+        # 3) if any newly booked is "now" return -> execute immediately
+        idx2 = find_booked_ready(t)
+        if idx2 is not None:
+            t = do_booked(tasks[idx2], t)
+            continue
 
-                actions.append(Action(now, now + move_duration_min, "MOVE", pick.park, pick.attraction, "移動"))
-                now += move_duration_min
+        # 4) do a WAIT task if exists
+        wait_tasks = [task for task in tasks if task["status"] == "todo" and task["mode"] == MODE_WAIT]
+        if wait_tasks:
+            # pick smallest expected wait at this hour
+            hour = hour_from_min(t, open_hour)
+            wait_tasks_sorted = sorted(
+                wait_tasks,
+                key=lambda x: get_wait_minutes(df_wait, x["park"], x["attraction"], hour),
+            )
+            t = do_wait(wait_tasks_sorted[0], t)
+            continue
 
-                actions.append(Action(now, now + w, "WAIT", pick.park, pick.attraction, f"待ち {w}分"))
-                now += w
+        # 5) nothing to do now -> jump to next booked return time, else finish
+        nb = next_booked_return_min()
+        if nb is None:
+            break
+        if nb > t:
+            # idle block
+            timeline.append(
+                {
+                    "開始": minutes_to_hhmm(t, open_hour),
+                    "終了": minutes_to_hhmm(min(nb, T_CLOSE), open_hour),
+                    "パーク": "",
+                    "アトラクション": "（待機）",
+                    "手段": "",
+                    "メモ": "次の確保枠まで待機",
+                }
+            )
+            t = nb
+            continue
 
-                actions.append(Action(now, now + ride_duration_min, "RIDE", pick.park, pick.attraction, "スタンバイ"))
-                now += ride_duration_min
+        # safety
+        t += 5
 
-                remaining.remove(pick)
-                continue
+    df = pd.DataFrame(timeline)
+    if df.empty:
+        df = pd.DataFrame(columns=["開始", "終了", "パーク", "アトラクション", "手段", "メモ"])
+    return df, notes
 
-            if pick.mode == "DPA":
-                last_h = get_last_bookable_hour(sellout_df, pick.park, pick.attraction, "DPA")
-                slot = next_available_slot_min(now, last_h)
-                if slot is None:
-                    # 取れないなら除外（または並びに切替等）
-                    remaining.remove(pick)
-                    continue
 
-                # 「今すぐ枠」なら即消化→即復活
-                if slot <= now:
-                    actions.append(Action(now, now, "DPA_BOOK", pick.park, pick.attraction, "DPA購入（即時枠）"))
+# =========================
+# Main
+# =========================
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-                    actions.append(Action(now, now + move_duration_min, "MOVE", pick.park, pick.attraction, "移動"))
-                    now += move_duration_min
+    if not login_gate():
+        st.title(APP_TITLE)
+        st.info("メンバー限定機能です。合言葉を入力してください。")
+        return
 
-                    actions.append(Action(now, now + ride_duration_min, "RIDE", pick.park, pick.attraction, "DPA即利用"))
-                    now += ride_duration_min
+    _ensure_state()
 
-                    next_dpa_ok = now
-                    remaining.remove(pick)
+    # points table init (needed early for download_button etc.)
+    if "df_points" not in st.session_state:
+        st.session_state["df_points"] = load_default_attractions_points().copy()
+
+    st.title(APP_TITLE)
+    render_about()
+
+    # dataset selector (ID)
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("## 🗂 データセット")
+        dataset_id = st.text_input("データセットID", value="2026-02-star1", help="例：2026-02-star1（wait/sellout/factor のファイル名に使います）")
+
+    # load dataset CSVs (minutes + sellout + factor)
+    df_wait = load_wait_table_minutes(dataset_id)
+    df_sellout = load_sellout_table(dataset_id)
+    df_factor = load_factor_table(dataset_id)
+
+    col_left, col_right = st.columns([1.0, 1.4], gap="large")
+
+    # =========================
+    # LEFT: conditions + evaluation + plan UI
+    # =========================
+    with col_left:
+        st.markdown("## 条件（補正）")
+
+        crowd_period = st.selectbox("混雑（時期の目安）", CROWD_PERIOD_OPTIONS, index=0)
+        crowd_stars = CROWD_STARS_BY_PERIOD.get(crowd_period, 2)
+
+        wait_tol = st.selectbox("待ち許容", ["30分まで", "60分まで", "90分まで"], index=1)
+        happy = st.checkbox("ハッピーエントリーあり（宿泊）", value=False)
+
+        st.markdown("---")
+        st.markdown("## 計画（シミュレーション）")
+
+        interval_min = st.selectbox("インターバル（移動/休憩の目安）", [0, 5, 10, 15, 20, 30], index=2)
+        ride_base_min = st.selectbox("乗車/出入口の最低時間（仮）", [10, 15, 20, 25], index=1)
+        st.caption("※待ち時間CSV（分）＋係数＋最低時間＋インターバルで、ざっくりタイムラインを組みます。")
+
+        # compute points total from selection (points still used for your evaluation logic)
+        df_points_now = st.session_state["df_points"].copy()
+        for c in ["wait", "dpa", "pp"]:
+            if c not in df_points_now.columns:
+                df_points_now[c] = pd.NA
+        df_points_now["wait"] = pd.to_numeric(df_points_now["wait"], errors="coerce").fillna(0.0)
+        df_points_now["dpa"] = pd.to_numeric(df_points_now["dpa"], errors="coerce")
+        df_points_now["pp"] = pd.to_numeric(df_points_now["pp"], errors="coerce")
+
+        plans = selected_to_plans(df_points_now, st.session_state["selected"])
+
+        # points total (simple sum by chosen mode)
+        total_points = 0.0
+        chosen_rows_points = []
+        for p in plans:
+            mode = p["mode"]
+            point = 0.0
+            if mode == MODE_WAIT:
+                point = float(p["points_wait"] or 0.0)
+            elif mode == MODE_DPA:
+                point = float(p["points_dpa"] or 0.0)
+            elif mode == MODE_PP:
+                point = float(p["points_pp"] or 0.0)
+            total_points += point
+            chosen_rows_points.append({"パーク": p["park"], "アトラクション": p["attraction"], "選択": mode, "点": point})
+
+        limit = (
+            crowd_limit_30min_from_stars(crowd_stars)
+            * wait_tolerance_factor(wait_tol)
+            * perk_modifier(happy)
+        )
+        ev = evaluate(total_points, limit)
+
+        # big metrics
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("合計点", f"{total_points:.1f} 点")
+        with m2:
+            st.metric("目安上限", f"{ev['limit']:.1f} 点")
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("決定（評価文を表示）", key="btn_confirm_left"):
+                st.session_state["confirmed"] = True
+        with b2:
+            if st.button("選択全解除（点数表）", key="btn_clear_left"):
+                clear_all_selections()
+
+        st.markdown("---")
+
+        if st.session_state.get("confirmed", False):
+            st.markdown(f"### 評価：{ev['label']}")
+            st.write(ev["message"])
+        else:
+            st.info("「決定」を押すと、評価とコピペ用文章が表示されます。")
+
+        st.markdown("---")
+        st.markdown("### 選択内容")
+        if chosen_rows_points:
+            df_sel = pd.DataFrame(chosen_rows_points).sort_values(["パーク", "点"], ascending=[True, False])
+            st.dataframe(df_sel, height=220, hide_index=True, use_container_width=True)
+        else:
+            st.caption("まだ何も選択されていません。")
+
+        # ---- Plan generation ----
+        st.markdown("---")
+        gen1, gen2 = st.columns([0.6, 0.4])
+        with gen1:
+            if st.button("🗓 計画を作る（時間割を提示）", key="btn_make_plan"):
+                st.session_state["plan_confirmed"] = True
+        with gen2:
+            if st.button("計画を非表示", key="btn_hide_plan"):
+                st.session_state["plan_confirmed"] = False
+
+        if st.session_state.get("plan_confirmed", False):
+            # override ride_base_min into simulation by temporarily adjusting global-ish variable:
+            # (骨組みなので build_schedule内の ride_base_min を固定している。ここでは notesとして扱う)
+            # → 今回は「最低時間」は表示だけに使い、骨組みは次回精密化で反映します。
+            st.caption(f"最低時間（仮）: {ride_base_min}分 / インターバル: {interval_min}分")
+
+            df_plan, notes = build_schedule(
+                plans=plans,
+                df_wait=df_wait,
+                df_sellout=df_sellout,
+                df_factor=df_factor,
+                crowd_stars=crowd_stars,
+                interval_min=interval_min,
+                open_hour=9,
+                close_hour=21,
+            )
+
+            st.markdown("### アトラクション計画（時間割）")
+            st.dataframe(df_plan, use_container_width=True, hide_index=True, height=420)
+
+            with st.expander("（参考）確保ログ / 注意点", expanded=False):
+                if notes:
+                    for n in notes:
+                        st.write("・" + n)
                 else:
-                    # 未来枠なら予約→60分後に購入権利復活
-                    actions.append(Action(now, now, "DPA_BOOK", pick.park, pick.attraction, f"DPA購入（{hhmm(slot)}枠）"))
-                    booked.append((pick.park, pick.attraction, "DPA", slot))
-                    next_dpa_ok = now + 60
-                    remaining.remove(pick)
-                continue
+                    st.write("（ログはありません）")
 
-            if pick.mode == "PP":
-                last_h = get_last_bookable_hour(sellout_df, pick.park, pick.attraction, "PP")
-                slot = next_available_slot_min(now, last_h)
-                if slot is None:
-                    remaining.remove(pick)
-                    continue
+            # copy text (updates every rerun; only shown after confirmed)
+            st.markdown("### 評価文（コピペ用）")
+            if st.session_state.get("confirmed", False):
+                copy_text = (
+                    f"条件：{crowd_period} / 待ち許容={wait_tol}"
+                    + (" / ハッピーエントリーあり" if happy else "")
+                    + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
+                    + f"\n評価：{ev['label']}\n{ev['message']}"
+                )
+                st.text_area(" ", value=copy_text, height=140)
+            else:
+                st.info("「決定」を押すと、ここに評価文が出ます。")
 
-                # PP：時間選択の自由なし（簡易では slot=now とみなす）
-                if slot <= now:
-                    actions.append(Action(now, now, "PP_GET", pick.park, pick.attraction, "PP取得（即時枠）"))
+        else:
+            # copy section even if plan hidden
+            st.markdown("### 評価文（コピペ用）")
+            if st.session_state.get("confirmed", False):
+                copy_text = (
+                    f"条件：{crowd_period} / 待ち許容={wait_tol}"
+                    + (" / ハッピーエントリーあり" if happy else "")
+                    + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
+                    + f"\n評価：{ev['label']}\n{ev['message']}"
+                )
+                st.text_area(" ", value=copy_text, height=140)
+            else:
+                st.info("「決定」を押すと、ここに評価文が出ます。")
 
-                    actions.append(Action(now, now + move_duration_min, "MOVE", pick.park, pick.attraction, "移動"))
-                    now += move_duration_min
+    # =========================
+    # RIGHT: points table
+    # =========================
+    with col_right:
+        st.markdown("## 点数表（選ぶ）")
+        st.caption("一覧はスクロールできます。点数もこの画面上で編集できます（自分用カスタム）。")
 
-                    actions.append(Action(now, now + ride_duration_min, "RIDE", pick.park, pick.attraction, "PP即利用"))
-                    now += ride_duration_min
+        # CSV IO (points table)
+        with st.expander("（任意）点数表CSVの読み込み/書き出し", expanded=False):
+            up = st.file_uploader("attractions_master.csv をアップロード（上書き）", type=["csv"])
+            if up is not None:
+                df_up = pd.read_csv(up)
+                for c in ["wait", "dpa", "pp"]:
+                    if c in df_up.columns:
+                        df_up[c] = pd.to_numeric(df_up[c], errors="coerce")
+                if "pp" not in df_up.columns:
+                    df_up["pp"] = pd.NA
+                if "park" in df_up.columns:
+                    df_up["park"] = df_up["park"].astype(str).str.strip()
+                if "attraction" in df_up.columns:
+                    df_up["attraction"] = df_up["attraction"].astype(str).str.strip()
+                if "park" in df_up.columns and "attraction" in df_up.columns:
+                    df_up = df_up.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
 
-                    next_pp_ok = now
-                    remaining.remove(pick)
-                else:
-                    actions.append(Action(now, now, "PP_GET", pick.park, pick.attraction, f"PP取得（{hhmm(slot)}枠）"))
-                    booked.append((pick.park, pick.attraction, "PP", slot))
-                    next_pp_ok = now + 120
-                    remaining.remove(pick)
-                continue
+                st.session_state["df_points"] = df_up
+                st.success("点数表を読み込みました。")
+                st.rerun()  # ここは反映優先
 
-        # 3) 何もできない場合：時間を進める（インターバル）
-        now += interval_min
+            st.download_button(
+                "現在の点数表をCSVでダウンロード",
+                st.session_state["df_points"].to_csv(index=False).encode("utf-8-sig"),
+                file_name="attractions_master.csv",
+                mime="text/csv",
+            )
 
-    return actions, remaining
+        # Park filter
+        fcol1, fcol2 = st.columns([0.45, 0.55])
+        with fcol1:
+            park_filter = st.selectbox("パーク絞り込み", ["ALL", "TDLのみ", "TDSのみ"], index=0)
+            st.session_state["park_filter"] = park_filter
+
+        # base df
+        df_points = st.session_state["df_points"].copy()
+        for c in ["wait", "dpa", "pp"]:
+            if c not in df_points.columns:
+                df_points[c] = pd.NA
+
+        df_points["wait"] = pd.to_numeric(df_points["wait"], errors="coerce").fillna(0.0)
+        df_points["dpa"] = pd.to_numeric(df_points["dpa"], errors="coerce")
+        df_points["pp"] = pd.to_numeric(df_points["pp"], errors="coerce")
+
+        # view filter
+        df_view = df_points.copy()
+        if park_filter == "TDLのみ":
+            df_view = df_view[df_view["park"] == "TDL"]
+        elif park_filter == "TDSのみ":
+            df_view = df_view[df_view["park"] == "TDS"]
+        df_view = df_view.reset_index(drop=True)
+
+        # header
+        h1, h2, h3, h4, h5 = st.columns([0.12, 0.55, 0.11, 0.11, 0.11])
+        h1.markdown("**パーク**")
+        h2.markdown("**アトラクション**")
+        h3.markdown("**並ぶ（点）**")
+        h4.markdown("**DPA（点）**")
+        h5.markdown("**PP（点）**")
+
+        st.caption("点数セルを押して選択（同一アトラクションは排他。もう一度押すと解除）")
+
+        with st.container(height=520):
+            for _, r in df_view.iterrows():
+                park = str(r.get("park", "")).strip()
+                name = str(r.get("attraction", "")).strip()
+                row_key = _row_id(park, name)
+
+                wait_p = float(r["wait"]) if pd.notna(r["wait"]) else 0.0
+                dpa_p = r["dpa"]
+                pp_p = r["pp"]
+
+                selected_mode = st.session_state["selected"].get(row_key)
+
+                c1, c2, c3, c4, c5 = st.columns([0.12, 0.55, 0.11, 0.11, 0.11], vertical_alignment="center")
+                c1.write(park)
+                c2.write(name)
+
+                c3.button(
+                    f"{wait_p:.0f}" if wait_p == int(wait_p) else f"{wait_p}",
+                    key=f"btn_wait__{row_key}",
+                    on_click=toggle_select,
+                    args=(row_key, MODE_WAIT),
+                    type=("primary" if selected_mode == MODE_WAIT else "secondary"),
+                    disabled=(wait_p <= 0),
+                    use_container_width=True,
+                )
+
+                c4.button(
+                    ("—" if pd.isna(dpa_p) else f"{float(dpa_p):.0f}"),
+                    key=f"btn_dpa__{row_key}",
+                    on_click=toggle_select,
+                    args=(row_key, MODE_DPA),
+                    type=("primary" if selected_mode == MODE_DPA else "secondary"),
+                    disabled=pd.isna(dpa_p),
+                    use_container_width=True,
+                )
+
+                c5.button(
+                    ("—" if pd.isna(pp_p) else f"{float(pp_p):.0f}"),
+                    key=f"btn_pp__{row_key}",
+                    on_click=toggle_select,
+                    args=(row_key, MODE_PP),
+                    type=("primary" if selected_mode == MODE_PP else "secondary"),
+                    disabled=pd.isna(pp_p),
+                    use_container_width=True,
+                )
+
+        with st.expander("（任意）点数表を編集する（並ぶ/DPA/PP）", expanded=False):
+            df_edit = df_points.rename(
+                columns={"park": "パーク", "attraction": "アトラクション", "wait": "並ぶ（点）", "dpa": "DPA（点）", "pp": "PP（点）"}
+            )
+            edited = st.data_editor(
+                df_edit,
+                key="points_editor_edit",
+                use_container_width=True,
+                height=420,
+                hide_index=True,
+                column_config={
+                    "パーク": st.column_config.SelectboxColumn("パーク", options=["TDL", "TDS"], width="small"),
+                    "アトラクション": st.column_config.TextColumn("アトラクション", width="large"),
+                    "並ぶ（点）": st.column_config.NumberColumn("並ぶ（点）", min_value=0.0, step=1.0, width="small"),
+                    "DPA（点）": st.column_config.NumberColumn("DPA（点）", width="small"),
+                    "PP（点）": st.column_config.NumberColumn("PP（点）", width="small"),
+                },
+            )
+            back = edited.rename(
+                columns={"パーク": "park", "アトラクション": "attraction", "並ぶ（点）": "wait", "DPA（点）": "dpa", "PP（点）": "pp"}
+            )
+            back["wait"] = pd.to_numeric(back["wait"], errors="coerce").fillna(0.0)
+            back["dpa"] = pd.to_numeric(back["dpa"], errors="coerce")
+            back["pp"] = pd.to_numeric(back["pp"], errors="coerce")
+
+            if not back.equals(st.session_state["df_points"]):
+                st.session_state["df_points"] = back
+                st.success("点数表を更新しました（選択状態は保持されます）。")
+                st.rerun()  # 編集反映は即がよい
 
 
-def actions_to_df(actions: List[Action]) -> pd.DataFrame:
-    rows = []
-    for a in actions:
-        rows.append({
-            "開始": hhmm(a.start_min),
-            "終了": hhmm(a.end_min),
-            "種別": a.kind,
-            "パーク": a.park,
-            "アトラクション": a.attraction,
-            "メモ": a.note,
-        })
-    return pd.DataFrame(rows)
+if __name__ == "__main__":
+    main()
