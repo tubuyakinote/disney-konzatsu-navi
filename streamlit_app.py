@@ -2,7 +2,7 @@
 import hashlib
 import hmac
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -74,7 +74,7 @@ def login_gate() -> bool:
 # =========================
 MODE_WAIT = "並ぶ"
 MODE_DPA = "DPA"
-MODE_PP = "PP"  # 追加
+MODE_PP = "PP"
 
 
 # =========================
@@ -86,7 +86,6 @@ def load_default_attractions() -> pd.DataFrame:
     attractions_master.csv をリポジトリに置く想定。
     列想定：
       park, attraction, wait, dpa, pp
-    無い場合は最小セットで起動。
     """
     import os
 
@@ -105,13 +104,11 @@ def load_default_attractions() -> pd.DataFrame:
         if "park" in df.columns and "attraction" in df.columns:
             df = df.drop_duplicates(subset=["park", "attraction"], keep="first").reset_index(drop=True)
 
-        # pp列が無い古いCSVでも動くように補完
         if "pp" not in df.columns:
             df["pp"] = pd.NA
 
         return df
 
-    # フォールバック
     return pd.DataFrame(
         [
             {"park": "TDS", "attraction": "ソアリン：ファンタスティック・フライト", "wait": 5, "dpa": 4, "pp": pd.NA},
@@ -128,7 +125,6 @@ def load_default_attractions() -> pd.DataFrame:
 # Modifiers / Evaluation
 # =========================
 def perk_modifier(happy_entry: bool) -> float:
-    # ハッピーエントリーのみ
     factor = 1.00
     if happy_entry:
         factor *= 1.15
@@ -143,7 +139,7 @@ def wait_tolerance_factor(wait_tolerance: str) -> float:
     }[wait_tolerance]
 
 
-# ★①：ユーザー指定の時期リストへ差し替え
+# ★時期リスト（ユーザー指定）
 CROWD_PERIOD_OPTIONS = [
     "1月 上旬（★★★）",
     "1月 中旬（★★）",
@@ -170,9 +166,6 @@ CROWD_STARS_BY_PERIOD = {label: label.count("★") for label in CROWD_PERIOD_OPT
 
 
 def crowd_limit_30min_from_stars(stars: int) -> float:
-    """
-    ★が少ないほど空いている＝許容点（目安上限）は高い
-    """
     base = {
         1: 12.0,  # 空いてる
         2: 9.0,   # ふつう
@@ -205,7 +198,7 @@ def normalize_raw_total(raw_total: float) -> float:
 
 
 # =========================
-# About (txt from same folder)
+# About
 # =========================
 def render_about():
     txt_path = Path(__file__).with_name("点数の考え方.txt")
@@ -227,8 +220,16 @@ def _ensure_state():
     st.session_state.setdefault("confirmed", False)
     st.session_state.setdefault("selected", {})  # row_key -> mode
     st.session_state.setdefault("park_filter", "ALL")
-    st.session_state.setdefault("copy_text_left", "")
-    st.session_state.setdefault("copy_sig_left", "")  # 表示内容の署名（更新判定用）
+
+    # DPA/PPの「次回権利が戻る時刻」（分）
+    # 9:00 = 0分 として扱う
+    st.session_state.setdefault("dpa_next_min", 0)
+    st.session_state.setdefault("pp_next_min", 0)
+
+    # 取得済みパス（保持する場合に使う：将来のスケジューラで利用）
+    # {"row_key": "...", "start_min": int, "end_min": int}
+    st.session_state.setdefault("held_dpa", None)
+    st.session_state.setdefault("held_pp", None)
 
 
 def _row_id(park: str, attraction: str) -> str:
@@ -246,8 +247,6 @@ def toggle_select(row_key: str, mode: str):
 def clear_all_selections():
     st.session_state["selected"] = {}
     st.session_state["confirmed"] = False
-    st.session_state["copy_text_left"] = ""
-    st.session_state["copy_sig_left"] = ""
 
 
 def compute_total_and_rows(df_points: pd.DataFrame, selected: Dict[str, str]) -> Tuple[float, List[Dict[str, Any]]]:
@@ -279,19 +278,44 @@ def compute_total_and_rows(df_points: pd.DataFrame, selected: Dict[str, str]) ->
     return normalize_raw_total(raw_total), chosen_rows
 
 
-def _make_copy_text(crowd_period: str, wait_tol: str, happy: bool, total_points: float, limit: float, label: str, msg: str) -> str:
-    return (
-        f"条件：{crowd_period} / 待ち許容={wait_tol}"
-        + (" / ハッピーエントリーあり" if happy else "")
-        + f"\n合計点：{total_points:.1f}点（目安上限 {limit:.1f}点）"
-        + f"\n評価：{label}\n{msg}"
-    )
+# =========================
+# DPA/PP rule core (組み込み用の核)
+# =========================
+def now_min_from_hour(hour: int) -> int:
+    # 9:00を0分として扱う
+    return (hour - 9) * 60
 
 
-def _make_sig(crowd_period: str, wait_tol: str, happy: bool, total_points: float, limit: float, label: str, msg: str) -> str:
-    # 画面が更新されても「同じ内容なら書き換えない」用の署名
-    base = f"{crowd_period}|{wait_tol}|{int(happy)}|{total_points:.3f}|{limit:.3f}|{label}|{msg}"
-    return sha256_hex(base)
+def min_to_hhmm(m: int) -> str:
+    hh = 9 + m // 60
+    mm = m % 60
+    return f"{hh:02d}:{mm:02d}"
+
+
+def is_now_slot(now_min: int, slot_start_min: int, slot_end_min: int) -> bool:
+    return slot_start_min <= now_min < slot_end_min
+
+
+def apply_dpa_rule_on_purchase(now_min: int, slot_start_min: int, slot_end_min: int) -> int:
+    """
+    DPA:
+      - 今すぐ枠なら、使って即戻る（= next = now）
+      - 今すぐ使えないなら、購入60分後に権利復活
+    """
+    if is_now_slot(now_min, slot_start_min, slot_end_min):
+        return now_min
+    return now_min + 60
+
+
+def apply_pp_rule_on_get(now_min: int, slot_start_min: int, slot_end_min: int) -> int:
+    """
+    PP:
+      - 今すぐ枠なら、使って即戻る（= next = now）
+      - 今すぐ使えないなら、取得120分後に権利復活
+    """
+    if is_now_slot(now_min, slot_start_min, slot_end_min):
+        return now_min
+    return now_min + 120
 
 
 # =========================
@@ -307,7 +331,7 @@ def main():
 
     _ensure_state()
 
-    # 先に点数表を確実に初期化（右カラムのdownload_buttonで参照するため）
+    # df init
     if "df_points" not in st.session_state:
         st.session_state["df_points"] = load_default_attractions().copy()
 
@@ -317,7 +341,7 @@ def main():
     col_left, col_right = st.columns([1.0, 1.4], gap="large")
 
     # =========================
-    # LEFT: conditions + results
+    # LEFT
     # =========================
     with col_left:
         st.markdown("## 条件（補正）")
@@ -330,7 +354,7 @@ def main():
 
         st.divider()
 
-        # 計算（現時点の session_state で）
+        # compute
         df_points_now = st.session_state["df_points"].copy()
         for c in ["wait", "dpa", "pp"]:
             if c not in df_points_now.columns:
@@ -348,7 +372,7 @@ def main():
         )
         ev = evaluate(total_points, limit)
 
-        # ★② 目安上限を合計点と同じ大きさに（st.metricで並べる）
+        # metrics (同じ大きさ)
         m1, m2 = st.columns(2)
         with m1:
             st.metric("合計点", f"{total_points:.1f} 点")
@@ -365,6 +389,7 @@ def main():
 
         st.divider()
 
+        # 評価
         if st.session_state.get("confirmed", False):
             st.markdown(f"### 評価：{ev['label']}")
             st.write(ev["message"])
@@ -373,6 +398,7 @@ def main():
 
         st.divider()
 
+        # 選択内容
         st.markdown("### 選択内容")
         if chosen_rows:
             df_sel = pd.DataFrame(chosen_rows).sort_values(["パーク", "点"], ascending=[True, False])
@@ -382,47 +408,33 @@ def main():
 
         st.divider()
 
-        # ===== コピー文（決定したら表示、決定後は内容を常に最新化）=====
+        # コピペ文：決定後のみ表示＆毎回最新に更新
         st.markdown("### 評価文（コピペ用）")
-
         if st.session_state.get("confirmed", False):
-            copy_text = _make_copy_text(
-                crowd_period=crowd_period,
-                wait_tol=wait_tol,
-                happy=happy,
-                total_points=total_points,
-                limit=ev["limit"],
-                label=ev["label"],
-                msg=ev["message"],
+            copy_text = (
+                f"条件：{crowd_period} / 待ち許容={wait_tol}"
+                + (" / ハッピーエントリーあり" if happy else "")
+                + f"\n合計点：{total_points:.1f}点（目安上限 {ev['limit']:.1f}点）"
+                + f"\n評価：{ev['label']}\n{ev['message']}"
             )
-            sig = _make_sig(
-                crowd_period=crowd_period,
-                wait_tol=wait_tol,
-                happy=happy,
-                total_points=total_points,
-                limit=ev["limit"],
-                label=ev["label"],
-                msg=ev["message"],
-            )
-
-            # 署名が変わったときだけ更新（ユーザーがtext_areaを触った場合の破壊を避けつつ、内容は追従）
-            if st.session_state.get("copy_sig_left", "") != sig:
-                st.session_state["copy_text_left"] = copy_text
-                st.session_state["copy_sig_left"] = sig
-
-            # value= は渡さない（keyのsession_stateが優先されるため）
-            st.text_area(" ", key="copy_text_left", height=140)
+            st.text_area(" ", value=copy_text, height=140, key="copy_text_left")
         else:
             st.info("「決定」を押すと、ここに評価文（コピペ用）が表示されます。")
 
+        # ---- DPA/PP状態の表示（今後の「順序最適化」に使う） ----
+        with st.expander("（開発用）DPA/PPの権利タイマー状態", expanded=False):
+            st.write(f"DPA 次回権利時刻（9:00起点）: {st.session_state['dpa_next_min']} 分（{min_to_hhmm(st.session_state['dpa_next_min'])}）")
+            st.write(f"PP  次回権利時刻（9:00起点）: {st.session_state['pp_next_min']} 分（{min_to_hhmm(st.session_state['pp_next_min'])}）")
+            st.write(f"held_dpa: {st.session_state['held_dpa']}")
+            st.write(f"held_pp : {st.session_state['held_pp']}")
+
     # =========================
-    # RIGHT: points table + filter + editor + CSV IO
+    # RIGHT
     # =========================
     with col_right:
         st.markdown("## 点数表（選ぶ）")
         st.caption("一覧はスクロールできます。点数もこの画面上で編集できます（自分用カスタム）。")
 
-        # CSV IO
         with st.expander("（任意）点数表CSVの読み込み/書き出し", expanded=False):
             up = st.file_uploader("attractions_master.csv をアップロード（上書き）", type=["csv"])
             if up is not None:
@@ -443,7 +455,6 @@ def main():
 
                 st.session_state["df_points"] = df_up
                 st.success("点数表を読み込みました。")
-                # 読み込み直後は反映が必要
                 _rerun()
 
             st.download_button(
@@ -453,13 +464,11 @@ def main():
                 mime="text/csv",
             )
 
-        # Park filter
         fcol1, fcol2 = st.columns([0.45, 0.55])
         with fcol1:
             park_filter = st.selectbox("パーク絞り込み", ["ALL", "TDLのみ", "TDSのみ"], index=0)
             st.session_state["park_filter"] = park_filter
 
-        # base df
         df_points = st.session_state["df_points"].copy()
         for c in ["wait", "dpa", "pp"]:
             if c not in df_points.columns:
@@ -469,7 +478,6 @@ def main():
         df_points["dpa"] = pd.to_numeric(df_points["dpa"], errors="coerce")
         df_points["pp"] = pd.to_numeric(df_points["pp"], errors="coerce")
 
-        # view filter
         df_view = df_points.copy()
         if park_filter == "TDLのみ":
             df_view = df_view[df_view["park"] == "TDL"]
@@ -477,17 +485,14 @@ def main():
             df_view = df_view[df_view["park"] == "TDS"]
         df_view = df_view.reset_index(drop=True)
 
-        # header
         h1, h2, h3, h4, h5 = st.columns([0.12, 0.55, 0.11, 0.11, 0.11])
         h1.markdown("**パーク**")
         h2.markdown("**アトラクション**")
         h3.markdown("**並ぶ（点）**")
         h4.markdown("**DPA（点）**")
         h5.markdown("**PP（点）**")
-
         st.caption("点数セルを押して選択（同一アトラクションは排他。もう一度押すと解除）")
 
-        # scroll container
         with st.container(height=520):
             for _, r in df_view.iterrows():
                 park = str(r.get("park", "")).strip()
@@ -534,7 +539,6 @@ def main():
                     use_container_width=True,
                 )
 
-        # editor
         with st.expander("（任意）点数表を編集する（並ぶ/DPA/PP）", expanded=False):
             df_edit = df_points.rename(
                 columns={"park": "パーク", "attraction": "アトラクション", "wait": "並ぶ（点）", "dpa": "DPA（点）", "pp": "PP（点）"}
