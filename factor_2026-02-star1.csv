@@ -1,0 +1,3 @@
+﻿park,attraction,dpa_sellout_speed,pp_sellout_speed,wait_multiplier_morning,wait_multiplier_noon,wait_multiplier_evening,notes
+TDS,ソアリン：ファンタスティック・フライト,1.2,1.3,0.85,1.15,0.9,例：混雑ほどDPA/PPが早く消える係数（1.0=標準）
+TDS,アナとエルサのフローズンジャーニー,1.35,1.4,0.9,1.2,0.95,
